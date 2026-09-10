@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Merge vacancies from every source into one batch, and route the verdicts back.
+"""Gather vacancies from every source into one batch, and route the verdicts back.
 
 The judgement lives in criteria.md and is the same whatever the source. What
 differs is the shape the vacancies arrive in and the call that records the
 verdict. This script absorbs both differences so a triage run is always:
 
-    collect -> merge -> read and judge -> route -> write
+    collect -> batch -> read and judge -> check applications -> route -> write
 
 Sources
   onetap    a search_vacancies response, saved to a file by the agent
   linkedin  the output of sources/linkedin.py fetch
 
 Subcommands
-  merge   normalise both sources into one batch, deduplicated across them
+  batch   normalise every source into one list of records to judge
   route   split a verdicts file into the calls each source needs
+
+Duplicates are NOT resolved here. A posting that arrives from two sources is
+judged twice and caught afterwards by the applications-check skill, which asks
+onetap whether the job is already in the pipeline. That check sees the whole
+application history, not just the postings in front of it, so it also catches
+a vacancy re-listed weeks after it was first judged.
 
 A LinkedIn verdict lands in three places, not one: the job is saved or
 dismissed on LinkedIn itself, a save additionally becomes an onetap custom
@@ -34,6 +40,9 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINKEDIN = os.path.join(HERE, "sources", "linkedin.py")
 LINKEDIN_ACTIONS = os.path.join(HERE, "sources", "linkedin_actions.py")
+
+# Every source a ref can name. `route` dispatches on the prefix of each ref.
+SOURCES = ("linkedin", "onetap")
 
 
 # --------------------------------------------------------------------------
@@ -121,69 +130,19 @@ def normalise_linkedin(payload):
 
 
 # --------------------------------------------------------------------------
-# cross-source dedup
-# --------------------------------------------------------------------------
-
-# Noise that differs between boards for the same posting: gender markers,
-# contract notes, work-model tags, the trailing "(TypeScript/React)" gloss.
-#
-# Seniority words are deliberately NOT stripped. They read like noise, but
-# "Junior Frontend Developer" and "Senior Frontend Developer" at the same
-# company are different postings, and collapsing them hides one of them
-# completely — Gate 6 never gets to see it. A missed merge costs one extra
-# read; a false merge costs a vacancy. Caught by the merge test on
-# Jit Team's Junior/Senior Frontend pair.
-TITLE_NOISE = re.compile(
-    r"\b(m\s*/\s*f|f\s*/\s*m|f/m/x|m/f/d|w/m/d|remote|hybrid|onsite|"
-    r"b2b|uop|full[- ]?time|part[- ]?time|contract)\b", re.I)
-
-
-def dedup_key(rec):
-    """Company + title, stripped down to what two boards would agree on."""
-    def clean(s):
-        s = (s or "").lower()
-        s = re.sub(r"\(.*?\)", " ", s)          # parenthetical stack glosses
-        s = TITLE_NOISE.sub(" ", s)
-        s = re.sub(r"[^a-z0-9Ѐ-ӿĀ-ſ ]+", " ", s)
-        return re.sub(r"\s+", " ", s).strip()
-    company = clean(rec.get("company"))
-    # Company suffixes vary by board: "Company E Ltd" vs "Company E".
-    company = re.sub(r"\b(sp z o o|s a|poland|polska|group|inc|ltd|llc|gmbh)\b", " ", company)
-    company = re.sub(r"\s+", " ", company).strip()
-    return company, clean(rec.get("title"))
-
-
-# onetap first: a vacancy already in that pipeline is the record to keep,
-# because it carries the application status and the user-facing link.
-SOURCE_RANK = {"onetap": 0, "linkedin": 1}
-
-
-def merge_records(groups):
-    """Collapse duplicates across and within sources."""
-    by_key = {}
-    for rec in sorted(groups, key=lambda r: (SOURCE_RANK.get(r["source"], 9),
-                                             -len(r.get("description") or ""))):
-        k = dedup_key(rec)
-        if not k[0] or not k[1]:
-            k = (rec["ref"], "")           # unkeyable — never merge it away
-        if k in by_key:
-            keeper = by_key[k]
-            keeper.setdefault("also_seen_as", []).append({
-                "ref": rec["ref"], "source": rec["source"], "link": rec["link"],
-            })
-            rec["duplicate_of"] = keeper["ref"]
-        else:
-            by_key[k] = rec
-    kept = list(by_key.values())
-    dropped = [r for r in groups if r.get("duplicate_of")]
-    return kept, dropped
-
-
-# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
-def cmd_merge(args):
+def cmd_batch(args):
+    """Normalise every source into one list of records to judge.
+
+    Every record that came back is kept, including postings that look like each
+    other. Collapsing them here would mean guessing from a company and a title
+    which two cards are one job, and a wrong guess hides a vacancy for good —
+    the judge never sees it. The applications-check skill answers the same
+    question afterwards from onetap's own pipeline, where it is a fact rather
+    than a guess, and at that point one extra read is all a duplicate has cost.
+    """
     records = []
     if args.onetap:
         with open(args.onetap) as f:
@@ -192,26 +151,24 @@ def cmd_merge(args):
         with open(args.linkedin) as f:
             records += normalise_linkedin(json.load(f))
     if not records:
-        sys.exit("nothing to merge — pass --onetap and/or --linkedin")
+        sys.exit("nothing to batch — pass --onetap and/or --linkedin")
 
-    kept, dropped = merge_records(records)
     by_source = {}
-    for r in kept:
+    for r in records:
         by_source[r["source"]] = by_source.get(r["source"], 0) + 1
 
     batch = {
-        "merged_at": datetime.now(timezone.utc).isoformat(),
-        "total_in": len(records),
-        "to_judge": len(kept),
-        "duplicates_collapsed": len(dropped),
+        "batched_at": datetime.now(timezone.utc).isoformat(),
+        "to_judge": len(records),
         "by_source": by_source,
-        "unreadable": [r["ref"] for r in kept if r.get("unreadable")],
-        "items": kept,
+        "unreadable": [r["ref"] for r in records if r.get("unreadable")],
+        "items": records,
     }
     out = json.dumps(batch, indent=2, ensure_ascii=False)
     if args.out:
         open(args.out, "w").write(out + "\n")
-        sys.stderr.write(f"{len(kept)} to judge, {len(dropped)} duplicates collapsed "
+        sys.stderr.write(f"{len(records)} to judge "
+                         f"({', '.join(f'{k}: {v}' for k, v in sorted(by_source.items()))}) "
                          f"-> {args.out}\n")
     else:
         print(out)
@@ -222,10 +179,10 @@ def cmd_collect(args):
 
     Only sources with a local fetcher can be collected this way. onetap comes
     through MCP tools the agent calls itself, so it has nothing to run here —
-    save the search_vacancies response to a file and pass it to `merge`.
+    save the search_vacancies response to a file and pass it to `batch`.
     """
     if args.source != "linkedin":
-        sys.exit(f"'{args.source}' has no local fetcher — see `merge --help`")
+        sys.exit(f"'{args.source}' has no local fetcher — see `batch --help`")
 
     search_out = args.out + ".search.json"
     cmd = [sys.executable, LINKEDIN, "search"]
@@ -441,11 +398,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    m = sub.add_parser("merge", help="normalise and deduplicate every source")
-    m.add_argument("--onetap", help="a saved search_vacancies response")
-    m.add_argument("--linkedin", help="a sources/linkedin.py fetch response")
-    m.add_argument("-o", "--out", help="write the batch here instead of stdout")
-    m.set_defaults(func=cmd_merge)
+    b = sub.add_parser("batch", help="normalise every source into one batch to judge")
+    b.add_argument("--onetap", help="a saved search_vacancies response")
+    b.add_argument("--linkedin", help="a sources/linkedin.py fetch response")
+    b.add_argument("-o", "--out", help="write the batch here instead of stdout")
+    b.set_defaults(func=cmd_batch)
 
     c = sub.add_parser("collect", help="run one source's fetch end to end")
     c.add_argument("--source", required=True, choices=["linkedin"])
@@ -463,8 +420,8 @@ def main():
 
     r = sub.add_parser("route", help="split verdicts into per-source calls")
     r.add_argument("verdicts")
-    r.add_argument("--batch", help="the merge output, for titles and descriptions")
-    r.add_argument("--only", choices=sorted(SOURCE_RANK),
+    r.add_argument("--batch", help="the batch output, for titles and descriptions")
+    r.add_argument("--only", choices=SOURCES,
                    help="route only this source's verdicts, ignoring the rest")
     r.add_argument("--apply-linkedin", action="store_true",
                    help="save/dismiss the jobs on LinkedIn itself (needs a session)")

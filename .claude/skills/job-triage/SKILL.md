@@ -50,19 +50,20 @@ python3 $S/triage.py sources          # what exists, its state, its filters
 
 ```bash
 python3 $S/triage.py collect --source linkedin --max-age-days 7 -o /tmp/linkedin.json
-python3 $S/triage.py merge --linkedin /tmp/linkedin.json -o /tmp/batch.json
-# ... judge ...
-python3 $S/triage.py route /tmp/verdicts.json --batch /tmp/batch.json
+python3 $S/triage.py batch --linkedin /tmp/linkedin.json -o /tmp/batch.json
+# ... judge, then check the keepers against the pipeline ...
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.json
 ```
 
 **onetap only:** save the `search_vacancies` response to `/tmp/onetap.json`, then
 
 ```bash
-python3 $S/triage.py merge --onetap /tmp/onetap.json -o /tmp/batch.json
+python3 $S/triage.py batch --onetap /tmp/onetap.json -o /tmp/batch.json
 ```
 
-**Both:** pass both flags to `merge`. This is the only way cross-source
-duplicates get collapsed, so prefer it when you are running a full sweep.
+**Both:** pass both flags to `batch`. Prefer it for a full sweep — the two
+feeds overlap, and a job seen twice is judged once per source but caught by the
+applications check before either verdict is written.
 
 `route` dispatches on each verdict's `ref`, so a mixed verdicts file needs no
 flags. To write one source's verdicts at a time — say, the onetap updates now
@@ -220,27 +221,26 @@ apart returned 19 and 17 cards with 9 postings the first never showed. A
 posting can surface days after it went up. Run daily rather than weekly, and
 trust `posted_at` over position.
 
-### 2. Merge
+### 2. Batch
 
 ```bash
-python3 $S/triage.py merge --onetap /tmp/onetap.json --linkedin /tmp/linkedin.json -o /tmp/batch.json
+python3 $S/triage.py batch --onetap /tmp/onetap.json --linkedin /tmp/linkedin.json -o /tmp/batch.json
 ```
 
-This normalises both shapes into one record type and deduplicates **across**
-sources as well as within them. Roughly 10% of results are duplicates, and the
-same job frequently sits in the onetap feed already, aggregated from another
-board.
+This normalises both shapes into one record type. That is all it does:
+everything that came back is judged, including postings that look like each
+other.
 
-When a posting is found in both places the onetap record wins — it carries the
-application status and the user-facing link — and the LinkedIn id is kept on it
-under `also_seen_as`. Judge the keeper once; do not create a custom vacancy for
-a LinkedIn job that merged into an onetap record.
+**Duplicates are not resolved here.** Roughly 10% of results are the same job
+from two places, and the temptation is to collapse them now — but at this point
+all there is to go on is a company and a title, and a wrong collapse hides a
+vacancy the judge never sees. The same question is answered for real after the
+gates, in step 6, by asking onetap whether the job is already in the pipeline.
+There the answer is a record with an id and a status, and it covers the whole
+application history rather than only the postings in this batch.
 
-The dedup key is company + title with cosmetic noise stripped. **Seniority
-words are deliberately kept significant**, so `Junior Frontend Developer` and
-`Senior Frontend Developer` at one company stay separate. The cost is the
-occasional missed merge, which is one extra read; the alternative loses a
-vacancy silently.
+The cost of waiting is one extra read for a duplicate. The cost of guessing
+early is a vacancy lost in silence.
 
 ### 3. Read every description
 
@@ -284,7 +284,8 @@ run once the candidate has answered. Do not guess and do not silently reject.
 
 ### 5. Write the verdicts
 
-One verdicts file for the whole batch, whatever the source:
+One verdicts file for the whole batch, whatever the source. It is not routed as
+it stands — step 6 checks the keepers first and produces the file that is:
 
 ```json
 [
@@ -299,10 +300,26 @@ One verdicts file for the whole batch, whatever the source:
 ]
 ```
 
-Then route it:
+### 6. Check the keepers against the pipeline
+
+Before anything is written, every `SAVED` verdict is checked against onetap's
+application pipeline: a job already saved, applied to, or rejected earlier must
+not enter it a second time.
+
+Use the **`applications-check` skill** — `.claude/skills/applications-check/`.
+It reads this verdicts file, asks `get_my_applications` one query per company,
+flips whatever is already tracked to `NOT_INTERESTED` with a note naming what
+it duplicates, and writes `/tmp/verdicts.checked.json`.
+
+Report every flip to the candidate. A keeper dropped silently is
+indistinguishable from a keeper that never existed.
+
+### 7. Route the verdicts
+
+Route the **checked** file, not the raw one:
 
 ```bash
-python3 $S/triage.py route /tmp/verdicts.json --batch /tmp/batch.json
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.json
 ```
 
 That prints the exact arguments for each call:
@@ -333,10 +350,10 @@ full of jobs already rejected. `--apply-linkedin` closes that loop: every
 
 ```bash
 # see the calls first — these are writes on a real account
-python3 $S/triage.py route /tmp/verdicts.json --batch /tmp/batch.json \
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.json \
         --apply-linkedin --dry-run
 
-python3 $S/triage.py route /tmp/verdicts.json --batch /tmp/batch.json --apply-linkedin
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.json --apply-linkedin
 ```
 
 This is the one part of the LinkedIn source that needs a **login**. Set the
@@ -381,7 +398,7 @@ dismiss stays visible instead of looking done.
 Once the writes have gone through, commit the LinkedIn verdicts to the ledger:
 
 ```bash
-python3 $S/triage.py route /tmp/verdicts.json --batch /tmp/batch.json \
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.json \
         --apply-linkedin --write-ledger
 ```
 
@@ -391,7 +408,7 @@ hundred rejections a week would cost a create call each and bury the real
 applications. They *are* dismissed on LinkedIn, which costs nothing and is
 where the candidate feels the difference.
 
-### 6. Notes discipline
+### 8. Notes discipline
 
 Every status change gets a note in English naming the gate and quoting the
 disqualifying line. Skipping this is expensive: 235 of the 245 September
@@ -411,12 +428,13 @@ Saved. TS/React/Node core, remote, 26.9-30.2k. Caveat: Kubernetes and Neo4j
 in the stack, 12-month contract.
 ```
 
-### 7. Report
+### 9. Report
 
 - how many were seen, how many were new, saved, rejected, per source
 - for LinkedIn, how many were bookmarked and dismissed on the site itself, and
   any call that failed
-- how many duplicates were collapsed, and any that merged across sources
+- how many keepers were already in the pipeline, what each one duplicates, and
+  the status it is tracked under — never drop one silently
 - the saved ones as a list, each with company, title, salary, work model, and
   the **onetap** link — never the original job board or LinkedIn URL
 - every `UNDECIDED` item with the question you want answered

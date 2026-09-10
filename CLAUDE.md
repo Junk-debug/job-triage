@@ -12,8 +12,12 @@ through the `onetap` MCP server.
   rejects, why, and every case already adjudicated. **Read this before judging
   any vacancy**, including a one-off question about a single posting, and
   whichever source it came from.
-- `.claude/skills/job-triage/triage.py` — merges every source into one batch,
-  deduplicates across them, and routes the verdicts back to the right call.
+- `.claude/skills/job-triage/triage.py` — normalises every source into one
+  batch to judge, and routes the verdicts back to the right call.
+- `.claude/skills/applications-check/SKILL.md` — the duplicate check that runs
+  after the gates: it asks onetap whether a keeper is already in the pipeline
+  and flips the ones that are to `NOT_INTERESTED`. Invoke with
+  `/applications-check`; the triage run calls it as its step 6.
 - `.claude/skills/job-triage/sources/` — one adapter per source, split into a
   read half and a write half. `linkedin.py` pulls postings from LinkedIn's
   public `jobs-guest` endpoints (no login, stdlib only); `linkedin_actions.py`
@@ -45,8 +49,10 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
 - Every status change gets a note in English naming the reason. Skipping this is
   expensive: 235 of the 245 September rejections had no note, so all of them had
   to be re-read from scratch to audit the batch.
-- Roughly 10% of results are duplicates from different sources — deduplicate
-  before writing verdicts, and keep the record with more information.
+- Roughly 10% of results are duplicates from different sources, and they are
+  **not** collapsed before judging. A duplicate costs one extra read; a wrong
+  collapse hides a vacancy the judge never sees. They are caught after the
+  gates by the applications check instead.
 - When the candidate corrects a verdict, update `criteria.md` so the correction
   survives the session.
 - One judgement, many sources. A source changes only how a vacancy is fetched
@@ -54,10 +60,10 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   source means a `normalise_*` function and a `route` branch in `triage.py`,
   and nothing else.
 - Sources run independently or together — `triage.py sources` lists them,
-  `merge` takes whichever `--onetap` / `--linkedin` files you have, and
-  `route --only <source>` writes one source's verdicts at a time. Run both
-  together for a full sweep, though: that is the only way cross-source
-  duplicates get collapsed.
+  `batch` takes whichever `--onetap` / `--linkedin` files you have, and
+  `route --only <source>` writes one source's verdicts at a time. Prefer a full
+  sweep anyway — the feeds overlap, and the applications check collapses what
+  the sweep sees twice.
 - The two sources keep their search in different places. onetap has a real
   saved search on the account (`useSavedFilters: true`); LinkedIn's guest API
   has none at all, so `linkedin/filters.json` **is** the saved filter.
@@ -83,9 +89,14 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   frequently on-site, senior roles are tagged `Associate`, and salary is absent
   from the guest view entirely. The queries cast wide on purpose and the
   description body decides.
-- Deduplicate across sources, not just within one. The same job is often in the
-  onetap feed already from another board; the onetap record wins, because it
-  carries the application status and the user-facing link.
+- A keeper is not finished when it passes the gates — it still has to be new.
+  Every `SAVED` verdict goes through the applications check before it is
+  written: the same job is often already in the pipeline, saved from another
+  board, applied to weeks ago, or rejected in an earlier batch. A hit becomes
+  `NOT_INTERESTED` with a note naming what it duplicates, and **is always
+  reported to the candidate** — a keeper dropped silently is indistinguishable
+  from one that never existed. There are 6000+ applications on the account, so
+  the check queries `get_my_applications` per company; it never dumps them all.
 - Verdicts on LinkedIn jobs go in `linkedin/ledger.json` whichever way
   they fall. Rejections are deliberately not pushed to onetap — the ledger is
   their record, and it is what stops them coming back on the next run.
