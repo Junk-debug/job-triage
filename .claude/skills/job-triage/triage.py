@@ -271,7 +271,10 @@ def cmd_route(args):
     batch = {}
     if args.batch:
         with open(args.batch) as f:
-            batch = {i["ref"]: i for i in json.load(f)["items"]}
+            b = json.load(f)
+        # `duplicates` too: a collapsed copy still gets a verdict of its own,
+        # and its ledger record needs the title and company like any other.
+        batch = {i["ref"]: i for i in b.get("items", []) + b.get("duplicates", [])}
 
     onetap_items, linkedin_creates, ledger, undecided = [], [], [], []
     linkedin_actions = []

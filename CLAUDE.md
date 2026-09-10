@@ -14,10 +14,12 @@ through the `onetap` MCP server.
   whichever source it came from.
 - `.claude/skills/job-triage/triage.py` — normalises every source into one
   batch to judge, and routes the verdicts back to the right call.
-- `.claude/skills/applications-check/SKILL.md` — the duplicate check that runs
-  after the gates: it asks onetap whether a keeper is already in the pipeline
-  and flips the ones that are to `NOT_INTERESTED`. Invoke with
-  `/applications-check`; the triage run calls it as its step 6.
+- `.claude/skills/applications-check/SKILL.md` — whether a job is already
+  known, in both senses: duplicated inside the batch (it clusters those before
+  judging, keeping the copy with the most information) and already in the
+  onetap pipeline (it flips those to `NOT_INTERESTED` after the gates). Invoke
+  with `/applications-check`; the triage run calls it at steps 3 and 7. The
+  measured thresholds live in that file — re-measure before changing one.
 - `.claude/skills/job-triage/sources/` — one adapter per source, split into a
   read half and a write half. `linkedin.py` pulls postings from LinkedIn's
   public `jobs-guest` endpoints (no login, stdlib only); `linkedin_actions.py`
@@ -49,10 +51,29 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
 - Every status change gets a note in English naming the reason. Skipping this is
   expensive: 235 of the 245 September rejections had no note, so all of them had
   to be re-read from scratch to audit the batch.
-- Roughly 10% of results are duplicates from different sources, and they are
-  **not** collapsed before judging. A duplicate costs one extra read; a wrong
-  collapse hides a vacancy the judge never sees. They are caught after the
-  gates by the applications check instead.
+- Roughly 10% of a batch is one job returned twice — the aggregators serve the
+  same posting from Just Join IT, Indeed and the employer feed, and none of the
+  copies is in the pipeline yet. They are collapsed before judging, but only on
+  evidence: same company, no seniority conflict, and 3-shingle containment of
+  the descriptions at or above 0.85. A shared title is **not** enough (Company C
+  posted one title twice at 0.595) and neither is a high score alone (Company C's
+  boilerplate carries different roles to 0.578). Everything between 0.50 and
+  0.85 is reported and judged separately.
+- The copy that survives a collapse is the one carrying the most information,
+  not the first one seen — salary weighs most, because Gate 4 turns on it and
+  most postings omit it. Of the real Company D pair only the Just Join IT copy stated
+  the rate. The survivor absorbs the others' fields, and anything they disagree
+  on rides along as `duplicates_disagree_on` for Gates 3 and 4 to read.
+- Nothing is ever dropped in silence. A collapsed copy keeps its ref, inherits
+  its primary's verdict, and is written back to its own source — that is what
+  stops the feed serving it again, and it is why a wrong collapse is the
+  expensive mistake: the candidate never learns the vacancy existed.
+- Two agencies advertising one end client's role under their own names are
+  **never** merged — the company names differ and the text nearly matches
+  (cross-company containment topped out at 0.060 across 1196 real pairs, so
+  anything above 0.35 is flagged). Ask the candidate which agency to go
+  through: applying via both can sink both applications. If they settle it as
+  a rule, that rule goes in `criteria.md`.
 - When the candidate corrects a verdict, update `criteria.md` so the correction
   survives the session.
 - One judgement, many sources. A source changes only how a vacancy is fetched
