@@ -49,7 +49,7 @@ python3 $S/triage.py sources          # what exists, its state, its filters
 **LinkedIn only:**
 
 ```bash
-python3 $S/triage.py collect --source linkedin --max-age-days 7 -o /tmp/linkedin.json
+python3 $S/triage.py collect --source linkedin --max-age-days 7 --workers 2 -o /tmp/linkedin.json
 python3 $S/triage.py batch --linkedin /tmp/linkedin.json -o /tmp/batch.json
 python3 $C/check.py cluster --batch /tmp/batch.json -o /tmp/batch.clustered.json
 # ... judge, then check the keepers against the pipeline ...
@@ -109,6 +109,15 @@ countries, and the date window. It deliberately does **not** copy categories
 (LinkedIn has no equivalent), experience levels (its filter is unreliable), or
 green/red words — those are judgement, and judgement lives in `criteria.md`.
 
+It also leaves out every keyword listed under `exclude_keywords` in
+`filters.json`, even while onetap still has it. onetap matches structured data
+and LinkedIn only full text, so a keyword can earn its place in one and not the
+other. Each entry records the measurement behind it: on 2026-09-10 `front-end`
+(1 posting no other keyword found — a duplicate of `Frontend`) and `Tailwind`
+(9 such postings, none kept, 58% not development at all) were dropped.
+Re-measure before adding one — per keyword, count the postings no other
+keyword found and how many of those were kept.
+
 ### Why it is a matrix
 
 LinkedIn has one location box and one workplace toggle, so it cannot express
@@ -118,7 +127,7 @@ what onetap expresses in a single query:
 
 So the search is a cross product — every keyword × every location group × every
 time window — and each cell is fired as its own request. The union of their
-results is the feed. 9 keywords × 3 location groups is 27 queries; check the
+results is the feed. 7 keywords × 3 location groups is 21 queries; check the
 expansion before spending them:
 
 ```bash
@@ -144,8 +153,8 @@ The old `maxPages: 3` default read like a page limit but was really a silent
 93% truncation on the broad queries. `--max-pages` still exists for cheap
 sampling while iterating; do not use it for a real sweep.
 
-That makes a full uncapped sweep of all 27 queries roughly **600–900 search
-requests** at ~1.75s each — on the order of 20–30 minutes before a single
+That made a full uncapped 14-day sweep of the original 27 queries roughly
+**600–900 search requests** at ~1.75s each — on the order of 20–30 minutes before a single
 description is fetched. Run `--dry-run` first, and prefer narrowing by
 `--keyword` / `--location` over capping pages when a full sweep is too much.
 
@@ -188,6 +197,29 @@ out of the body.
 
 ## Procedure
 
+### 0. Ask how hard to parallelise
+
+Before collecting, ask the candidate — one `AskUserQuestion` call, only the
+questions that apply to this run's sources:
+
+1. **Description fetches** (LinkedIn): 1, 2 (recommended) or 3 workers →
+   `--workers` in step 1. Reads send no cookies, so the account is never
+   exposed; but the IP is the one the candidate's browser uses, and LinkedIn
+   throttles bursts. On a 429 every worker backs off together, and the code
+   caps it at 4 whatever is asked. On 2026-09-10 one worker took 29 minutes
+   for 463 descriptions, with one timeout and no 429s.
+2. **Judging**: 5 agents (recommended), 3 agents, or sequentially yourself →
+   "Judging in parallel" under step 5. Read sequentially, 375 postings took 35
+   minutes on 2026-09-10. Agents cut the wall-clock; the extra cost is each
+   one reading `criteria.md` on top of its share of the postings.
+
+If the candidate already said how in this request, use that and do not ask.
+
+**Writes are never parallelised**, whatever the answers: save and dismiss on
+LinkedIn stay one call at a time with their pause. That is the candidate's
+decision (2026-09-10) — a burst of writes is what would put the account at
+risk.
+
 ### 1. Collect
 
 **onetap.** Call `get_my_filters`, then `search_vacancies` with
@@ -200,15 +232,17 @@ Save the response to `/tmp/onetap.json`.
 public `jobs-guest` endpoints. (Only the *writes* in step 5 need a session.)
 
 ```bash
-python3 $S/triage.py collect --source linkedin --max-age-days 7 -o /tmp/linkedin.json
+python3 $S/triage.py collect --source linkedin --max-age-days 7 --workers 2 -o /tmp/linkedin.json
 ```
 
 That runs search and fetch together, skipping the fetch when nothing is new.
+`--workers` is the answer from step 0 (default 1, capped at 4). It parallelises
+the description fetches only; the search itself stays one request at a time.
 Run the two halves separately when you want to inspect what came back first:
 
 ```bash
 python3 $S/sources/linkedin.py search --max-age-days 7 > /tmp/li-search.json
-python3 $S/sources/linkedin.py fetch --from-search /tmp/li-search.json > /tmp/linkedin.json
+python3 $S/sources/linkedin.py fetch --from-search /tmp/li-search.json --workers 2 > /tmp/linkedin.json
 ```
 
 `search` drops everything already in the ledger, and deduplicates across matrix
@@ -308,6 +342,55 @@ When a gate genuinely cannot be settled from the posting — `criteria.md` names
 City X and City Y under §5 as exactly this — use verdict `UNDECIDED` with a
 `question`. Undecided items are written nowhere, so they resurface on the next
 run once the candidate has answered. Do not guess and do not silently reject.
+
+#### Judging in parallel
+
+When step 0 chose agents, split the clustered batch and hand the files out:
+
+```bash
+python3 $S/triage.py chunk --batch /tmp/batch.clustered.json --agents 5 -o /tmp/chunks
+```
+
+That writes `chunk_000.txt`… of 15 postings each, rendered the way a judge
+should read them — description in full, no aggregator keywords — and
+`manifest.json`, which assigns the files to the agents, biggest first to the
+least loaded so they finish together.
+
+Spawn every agent in **one** message (Agent tool, `general-purpose`), one per
+entry of `manifest.json` → `agents`, each with this brief:
+
+> Read `.claude/skills/job-triage/criteria.md` in full first — it decides every
+> verdict. Then read each of these files in full: <its chunks>, in <dir>. For
+> each `chunk_NNN.txt` write `v_NNN.json` beside it: a JSON array, one object
+> per posting, in the shape of step 6 of `.claude/skills/job-triage/SKILL.md` —
+> `ref`, `verdict` (`SAVED`, `NOT_INTERESTED`, `UNDECIDED` with a `question`,
+> or `UNREADABLE`), `reason`, and for a save `keywords`, `workplaceType`,
+> `experienceLevels`, `employmentTypes`. Apply Gates 1–6 in order; the first
+> failure names the reason. Never judge from the title — read the
+> requirements. Every rejection quotes the line that decides it, copied
+> verbatim from the posting in its own language. When a gate cannot be settled
+> from the text, use `UNDECIDED` with the question; never guess. Write only
+> those files — no other changes, no MCP calls. Reply with the counts per
+> verdict.
+
+Then merge and check what came back:
+
+```bash
+python3 $S/triage.py merge --batch /tmp/batch.clustered.json --dir /tmp/chunks -o /tmp/verdicts.json
+```
+
+It **refuses** to write on a structural gap — a posting with no verdict, one
+judged twice, a ref not in the batch, a save or rejection without a reason, an
+`UNDECIDED` without a question. Re-run the agent on that chunk. It **warns**,
+under `recheck`, about every rejection with no quote or with a quote that is
+not in the posting — diacritics, dashes and case are folded first, so
+ASCII-typed Polish still matches. Such a reason was paraphrased or invented:
+re-read each of those postings yourself.
+
+Then, before step 7, read these in full yourself, whatever the agents said:
+every `SAVED`, every `UNDECIDED`, and every `recheck`. The agents settle the
+rejections; the keepers and the questions are what the candidate acts on, and
+there are few of them — 23 of 375 on 2026-09-10.
 
 ### 6. Write the verdicts
 

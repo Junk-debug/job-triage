@@ -25,10 +25,12 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,16 +52,42 @@ PAGE_SIZE = 10          # the endpoint returns 10 cards regardless of what you a
 MAX_START = 975         # start=1000 answers 400
 MAX_PAGES = MAX_START // PAGE_SIZE + 1   # the backstop; the empty page ends it first
 STALL_PAGES = 2         # consecutive all-repeat pages before calling it done
+# Parallel description fetches. Guest reads carry no cookies, so the account
+# is never exposed, but the IP is the one the candidate's browser uses and
+# LinkedIn throttles bursts - so the ceiling stays low whatever is asked for.
+MAX_FETCH_WORKERS = 4
 
 
 # --------------------------------------------------------------------------
 # http
 # --------------------------------------------------------------------------
 
+# One cooldown shared by every thread: when LinkedIn answers 429, all the
+# workers back off, not only the one that was told to.
+_cooldown_lock = threading.Lock()
+_cooldown_until = 0.0
+
+
+def _start_cooldown(seconds):
+    global _cooldown_until
+    with _cooldown_lock:
+        _cooldown_until = max(_cooldown_until, time.monotonic() + seconds)
+
+
+def _wait_cooldown():
+    while True:
+        with _cooldown_lock:
+            left = _cooldown_until - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(left)
+
+
 def get(url, tries=4, timeout=30):
     """GET with backoff. Returns decoded text, or None when the job is gone."""
     delay = 2.0
     for attempt in range(tries):
+        _wait_cooldown()
         req = urllib.request.Request(url, headers={
             "User-Agent": UA,
             "Accept": "text/html,application/xhtml+xml",
@@ -79,6 +107,8 @@ def get(url, tries=4, timeout=30):
             # 429 and 5xx are worth waiting out.
             if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
                 sys.stderr.write(f"  http {e.code}, retrying in {delay:.0f}s\n")
+                if e.code == 429:
+                    _start_cooldown(delay)
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -510,7 +540,8 @@ def cmd_sync_filters(args):
 
     What cannot cross over: categories (LinkedIn has no equivalent),
     experienceLevels (its f_E filter is unreliable), and green/red words (they
-    are judgement, and judgement lives in criteria.md).
+    are judgement, and judgement lives in criteria.md). Keywords listed under
+    `exclude_keywords` in the filters file stay out even when onetap has them.
     """
     with open(args.onetap_filters) as f:
         src = json.load(f)
@@ -521,8 +552,16 @@ def cmd_sync_filters(args):
     before_kw = list(filters.get("keywords", []))
     before_loc = [l["name"] for l in filters.get("locations", [])]
 
+    # Keywords measured as dead weight stay out even though onetap still has
+    # them - onetap matches structured data, LinkedIn only full text, and a
+    # keyword can earn its place in one and not the other.
+    excluded = {k.lower() for k in filters.get("exclude_keywords", {}) if not k.startswith("_")}
+    dropped = []
     if src.get("keywords"):
-        filters["keywords"] = list(dict.fromkeys(src["keywords"]))
+        kept = []
+        for k in dict.fromkeys(src["keywords"]):
+            (dropped if k.lower() in excluded else kept).append(k)
+        filters["keywords"] = kept
 
     # Each onetap workplace group becomes one location group per place. Groups
     # for the same place are then merged, because the workplace dimension is
@@ -582,7 +621,7 @@ def cmd_sync_filters(args):
     queries, collapsed = expand_queries(filters)
     report = {
         "keywords": {"before": len(before_kw), "after": len(filters["keywords"]),
-                     "value": filters["keywords"]},
+                     "value": filters["keywords"], "excluded": dropped},
         "locations": {"before": before_loc,
                       "after": [{"name": l["name"],
                                  "target": l.get("geoId") or l.get("location"),
@@ -630,23 +669,34 @@ def cmd_fetch(args):
     if args.limit:
         ids = ids[:args.limit]
 
-    jobs = []
-    for i, jid in enumerate(ids, 1):
-        sys.stderr.write(f"  [{i}/{len(ids)}] {jid}\n")
+    workers = max(1, min(args.workers, MAX_FETCH_WORKERS))
+    progress = {"done": 0}
+    lock = threading.Lock()
+
+    def one(jid):
         job = fetch_posting(jid)
         card = cards.get(jid)
         if card:
             for k in CARRY_OVER:
                 if card.get(k) is not None:
                     job[k] = card[k]
-        jobs.append(job)
-        if i < len(ids):
-            polite()
+        with lock:
+            progress["done"] += 1
+            sys.stderr.write(f"  [{progress['done']}/{len(ids)}] {jid}\n")
+        # Every worker keeps its own pause, so N workers run at about N times
+        # the single-worker rate - never a burst.
+        polite()
+        return job
+
+    # map() hands the results back in input order, whatever order they finish in.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        jobs = list(pool.map(one, ids))
 
     ok = [j for j in jobs if j.get("ok")]
     print(json.dumps({
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "requested": len(ids),
+        "workers": workers,
         "ok": len(ok),
         "failed": len(jobs) - len(ok),
         "jobs": jobs,
@@ -725,6 +775,8 @@ def main():
     f.add_argument("job_ids", nargs="*")
     f.add_argument("--from-search", help="read job ids from a search output file")
     f.add_argument("--limit", type=int, default=None)
+    f.add_argument("--workers", type=int, default=1,
+                   help=f"parallel fetches, capped at {MAX_FETCH_WORKERS} (default 1)")
     f.set_defaults(func=cmd_fetch)
 
     r = sub.add_parser("record", help="write verdicts to the ledger")

@@ -90,10 +90,18 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   `route --only <source>` writes one source's verdicts at a time. Prefer a full
   sweep anyway — the feeds overlap, and the applications check collapses what
   the sweep sees twice.
+- A triage run asks first how hard to parallelise: how many workers fetch
+  LinkedIn descriptions (capped at 4), and whether agents judge the batch in
+  parallel (`triage.py chunk`, then `merge`, which refuses gaps and flags
+  rejections whose quote is not in the posting). Writes to LinkedIn are never
+  parallelised — save and dismiss stay one call at a time with their pause,
+  because a burst of writes is what would put the account at risk.
 - The two sources keep their search in different places. onetap has a real
   saved search on the account (`useSavedFilters: true`); LinkedIn's guest API
   has none at all, so `linkedin/filters.json` **is** the saved filter.
-  Keep it in sync with `linkedin.py sync-filters <get_my_filters dump>`.
+  Keep it in sync with `linkedin.py sync-filters <get_my_filters dump>`;
+  its `exclude_keywords` keeps keywords measured as dead weight out of the
+  search even while onetap still lists them.
 - LinkedIn's search is a **matrix**, because it has one location box and one
   workplace toggle and so cannot express "remote in Poland OR hybrid/onsite in
   Warsaw or Gdańsk" in one query. Keywords × location groups × time windows are

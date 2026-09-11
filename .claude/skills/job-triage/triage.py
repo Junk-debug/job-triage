@@ -14,6 +14,8 @@ Sources
 Subcommands
   batch   normalise every source into one list of records to judge
   route   split a verdicts file into the calls each source needs
+  chunk   split a batch into files for parallel judges
+  merge   merge the judges' verdict files and check them
 
 Duplicates are NOT resolved here. A posting that arrives from two sources is
 judged twice and caught afterwards by the applications-check skill, which asks
@@ -30,11 +32,13 @@ one more destination. Nothing else changes.
 """
 
 import argparse
+import glob
 import json
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -211,7 +215,8 @@ def cmd_collect(args):
         print(json.dumps({"new_count": 0, "fetched": 0, "out": args.out}, indent=2))
         return
 
-    cmd = [sys.executable, LINKEDIN, "fetch", "--from-search", search_out]
+    cmd = [sys.executable, LINKEDIN, "fetch", "--from-search", search_out,
+           "--workers", str(args.workers)]
     if args.limit:
         cmd += ["--limit", str(args.limit)]
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -396,6 +401,165 @@ def cmd_route(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+# --------------------------------------------------------------------------
+# parallel judging
+# --------------------------------------------------------------------------
+
+VERDICTS = ("SAVED", "NOT_INTERESTED", "UNDECIDED", "UNREADABLE")
+
+
+def load_items(path):
+    with open(path) as f:
+        data = json.load(f)
+    return data["items"] if isinstance(data, dict) else data
+
+
+def render_item(n, it):
+    """One posting the way a judge should read it. The aggregator's keywords
+    are left out on purpose - Gate 0: the description decides."""
+    lines = ["=" * 100,
+             f"[{n}] {it['ref']} | {it.get('company')} | {it.get('title')}",
+             f"loc={it.get('location')} wp={it.get('workplace')} "
+             f"exp_wp={it.get('expected_workplace')} "
+             f"seniority_tag={it.get('seniority_tag')} posted={it.get('published_at')}"]
+    if it.get("salary"):
+        lines.append("SALARY: " + json.dumps(it["salary"], ensure_ascii=False))
+    if it.get("salary_hints"):
+        lines.append("SALARY_HINTS: " + " | ".join(it["salary_hints"]))
+    if it.get("duplicates_disagree_on"):
+        lines.append("DUPLICATES_DISAGREE_ON: "
+                     + json.dumps(it["duplicates_disagree_on"], ensure_ascii=False))
+    lines.append("-" * 40 + " DESCRIPTION " + "-" * 40)
+    lines.append(it.get("description") or "(no description - verdict UNREADABLE)")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_chunk(args):
+    """Split a batch into files for parallel judges, balanced across agents."""
+    items = load_items(args.batch)
+    os.makedirs(args.out_dir, exist_ok=True)
+    chunks = []
+    for c, start in enumerate(range(0, len(items), args.size)):
+        part = items[start:start + args.size]
+        text = "".join(render_item(start + i + 1, it) for i, it in enumerate(part))
+        name = f"chunk_{c:03d}.txt"
+        with open(os.path.join(args.out_dir, name), "w") as f:
+            f.write(text)
+        chunks.append({"file": name, "verdicts": f"v_{c:03d}.json",
+                       "refs": [it["ref"] for it in part], "chars": len(text)})
+
+    # Biggest files first, each to the least-loaded agent, so the agents finish
+    # together instead of one of them carrying all the long postings.
+    agents = [{"chunks": [], "chars": 0} for _ in range(max(1, args.agents))]
+    for ch in sorted(chunks, key=lambda c: -c["chars"]):
+        a = min(agents, key=lambda a: a["chars"])
+        a["chunks"].append(ch["file"])
+        a["chars"] += ch["chars"]
+    for a in agents:
+        a["chunks"].sort()
+
+    with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
+        json.dump({"batch": os.path.abspath(args.batch), "items": len(items),
+                   "chunks": chunks, "agents": agents}, f, indent=2, ensure_ascii=False)
+    print(json.dumps({"items": len(items), "chunks": len(chunks), "agents": agents,
+                      "out_dir": os.path.abspath(args.out_dir)}, indent=2))
+
+
+# Reasons are typed on one line, often in ASCII ('znajomosc'), over a posting
+# written in Polish with bullets, labels and odd spacing. Both sides are folded
+# and then squashed to letters and digits before comparing - measured on the
+# 2026-09-10 batch, spacing and bullets alone made 4 of 8 real quotes look
+# invented.
+_FOLD = str.maketrans({"ł": "l", "Ł": "L", "’": "'", "‘": "'",
+                       "“": '"', "”": '"', "„": '"'})
+QUOTE_RX = re.compile(r"""(?<!\w)['"‘“„](.+?)['"’”](?!\w)""")
+MIN_QUOTE = 8
+
+
+def fold(text):
+    text = unicodedata.normalize("NFKD", (text or "").translate(_FOLD))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def squash(text):
+    return re.sub(r"[^0-9a-z]+", "", text)
+
+
+def quotes_in(reason):
+    """The quoted fragments of a reason, split where the quote elides."""
+    out = []
+    for q in QUOTE_RX.findall(reason or ""):
+        for frag in re.split(r"\.\.\.|…", q):
+            frag = fold(frag).strip(" .,;:")
+            # Length is judged before squashing, so a short real quote such as
+            # '2-5+ years' still counts as one.
+            if len(frag) >= MIN_QUOTE and squash(frag):
+                out.append(frag)
+    return out
+
+
+def cmd_merge(args):
+    """Collect the judges' verdict files into one, and check them.
+
+    A structural gap stops the merge: a posting without a verdict is written
+    nowhere and quietly comes back, and one judged twice has no single answer.
+    A quote that is not in the posting does not stop it - it goes to `recheck`,
+    because a rejection nobody re-reads must at least cite text that exists.
+    Keepers and questions are not checked here: the main agent reads all of
+    them anyway."""
+    items = {it["ref"]: it for it in load_items(args.batch)}
+    files = sorted(glob.glob(os.path.join(args.dir, "v_*.json")))
+    verdicts, seen, problems = [], {}, []
+    for path in files:
+        name = os.path.basename(path)
+        with open(path) as f:
+            for v in json.load(f):
+                ref = v.get("ref")
+                if ref in seen:
+                    problems.append(f"{ref}: judged twice ({seen[ref]} and {name})")
+                    continue
+                seen[ref] = name
+                if ref not in items:
+                    problems.append(f"{ref}: not in the batch ({name})")
+                    continue
+                if v.get("verdict") not in VERDICTS:
+                    problems.append(f"{ref}: unknown verdict {v.get('verdict')!r}")
+                elif v["verdict"] == "UNDECIDED" and not v.get("question"):
+                    problems.append(f"{ref}: UNDECIDED without a question")
+                elif v["verdict"] in ("SAVED", "NOT_INTERESTED") and not v.get("reason"):
+                    problems.append(f"{ref}: {v['verdict']} without a reason")
+                verdicts.append(v)
+    problems += [f"{ref}: no verdict" for ref in items if ref not in seen]
+
+    recheck = []
+    for v in verdicts:
+        if v.get("verdict") != "NOT_INTERESTED":
+            continue
+        it = items[v["ref"]]
+        hay = squash(fold(" ".join(str(it.get(k) or "")
+                                   for k in ("title", "location", "description"))))
+        quotes = quotes_in(v.get("reason"))
+        missing = [q for q in quotes if squash(q) not in hay]
+        if not quotes:
+            recheck.append({"ref": v["ref"], "why": "no quote"})
+        elif missing:
+            recheck.append({"ref": v["ref"], "why": "quote not in the posting",
+                            "missing": missing})
+
+    report = {"files": len(files), "batch": len(items), "verdicts": len(verdicts),
+              "counts": {k: sum(1 for v in verdicts if v.get("verdict") == k)
+                         for k in VERDICTS},
+              "problems": problems, "recheck": recheck}
+    if problems:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        sys.exit(f"{len(problems)} structural problem(s) - nothing written")
+    with open(args.out, "w") as f:
+        json.dump(verdicts, f, indent=1, ensure_ascii=False)
+    report["out"] = args.out
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -416,6 +580,8 @@ def main():
     c.add_argument("--location", action="append", help="run only this location group (repeatable)")
     c.add_argument("--keyword", action="append", help="run only this keyword (repeatable)")
     c.add_argument("--limit", type=int, default=None, help="cap postings fetched")
+    c.add_argument("--workers", type=int, default=1,
+                   help="parallel description fetches (SKILL.md step 0; capped at 4)")
     c.set_defaults(func=cmd_collect)
 
     sub.add_parser("sources", help="list sources, their state and their filters"
@@ -433,6 +599,20 @@ def main():
     r.add_argument("--write-ledger", action="store_true",
                    help="commit the LinkedIn verdicts to the ledger")
     r.set_defaults(func=cmd_route)
+
+    k = sub.add_parser("chunk", help="split a batch into files for parallel judges")
+    k.add_argument("--batch", required=True, help="the clustered batch")
+    k.add_argument("-o", "--out-dir", required=True, help="where to write the files")
+    k.add_argument("--size", type=int, default=15, help="postings per file (default 15)")
+    k.add_argument("--agents", type=int, default=1,
+                   help="how many judges to balance the files across")
+    k.set_defaults(func=cmd_chunk)
+
+    m = sub.add_parser("merge", help="merge the judges' verdict files and check them")
+    m.add_argument("--batch", required=True, help="the clustered batch the files came from")
+    m.add_argument("--dir", required=True, help="the chunk directory holding v_*.json")
+    m.add_argument("-o", "--out", required=True, help="where to write the merged verdicts")
+    m.set_defaults(func=cmd_merge)
 
     args = p.parse_args()
     args.func(args)
