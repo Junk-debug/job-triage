@@ -1,12 +1,15 @@
 ---
 name: applications-check
-description: Find out whether a vacancy is already known — either duplicated inside the current batch, or already in the candidate's onetap pipeline. Collapses the copies of one job that the aggregators return from several boards, keeping the copy with the most information; flips keepers that are already saved, applied to or rejected into NOT_INTERESTED; and raises the ambiguous cases as questions instead of guessing. Use during a triage run, before judging and again before verdicts are written, or on its own to answer whether a specific job is already in the pipeline.
+description: Find out whether a vacancy is already known — either duplicated inside the current batch, or already in the candidate's onetap pipeline. Collapses the copies of one job that the aggregators return from several boards, keeping the copy with the most information; flips keepers that are already saved, applied to or rejected into NOT_INTERESTED; and raises the ambiguous cases as questions instead of guessing. Use during a triage run, before judging and again before verdicts are written; on its own to answer whether a specific job is already in the pipeline; or to sweep the pipeline itself (SAVED and APPLIED) for jobs it is holding twice.
 ---
 
 # Applications check
 
 Two different questions, one answer each run: **is this job already in the
-batch twice, and is it already in the pipeline?**
+batch twice, and is it already in the pipeline?** The same clustering answers a
+third, on demand: **is the pipeline holding one job twice?** — a keeper saved
+again a month after it was applied to, or one posting applied to twice through
+two spellings of an agency.
 
 Neither is a matter of taste. Both have a right answer, and both are cheap to
 get wrong in the same expensive way — a vacancy collapsed into another one is
@@ -20,9 +23,15 @@ of the copy that was judged, and is written back to its own source so the feed
 stops serving it.
 
 ```
-batch -> cluster -> judge the primaries -> queries -> get_my_applications
-      -> match -> route
+batch    -> cluster -> judge the primaries -> queries -> get_my_applications
+         -> match -> route
+pipeline -> cluster -> report
 ```
+
+`cluster` is the whole engine and it does not care where the records came
+from — a fresh batch off the boards and the candidate's own applications are
+the same shape, so the difference between the two runs is only which command
+builds the batch.
 
 ---
 
@@ -108,7 +117,16 @@ in the notes.
 
 **`same_job_different_company`** — the agency case. Two agencies advertise one
 end client's role under their own names, so the company names never match and
-the text nearly does. Across 1196 cross-company pairs in the sample the
+the text nearly does.
+
+One spelling is resolved before this fires: an abbreviation against the full
+name, when both are in the batch and exactly one full name claims the initials.
+`ACG` and `Acme Consulting Group` are one agency, and the pipeline held the
+same posting under both — 0.990 on an identical title, applied to twice a day
+apart — while reading as two agencies on one end client. The initials come from
+the cleaned name, not the company key, because the key strips the `Group` that
+the abbreviation keeps. An acronym two companies in the batch could answer to is
+left alone. Across 1196 cross-company pairs in the sample the
 containment never exceeded 0.060, so anything above **0.35** is extraordinary
 and is flagged.
 
@@ -195,6 +213,64 @@ is a duplicate rather than a rejection.
 That wording matters. A future audit reading `NOT_INTERESTED` must be able to
 tell a duplicate from a rejection on the merits, or the role looks twice
 rejected.
+
+---
+
+## Part 3 — is the pipeline holding one job twice?
+
+Parts 1 and 2 both look outward: they protect a fresh batch from the pipeline
+and from itself. Neither looks at the pipeline on its own, and it drifts —
+a job applied to in August is saved again in September off another board, or
+one agency's posting is applied to twice under two spellings of its name.
+
+```bash
+C=.claude/skills/applications-check
+python3 $C/check.py pipeline --applications /tmp/saved.json /tmp/applied.json \
+        -o /tmp/pipeline.json
+python3 $C/check.py cluster --batch /tmp/pipeline.json -o /tmp/pipeline.clustered.json
+```
+
+`--applications` takes saved `get_my_applications` answers, one file per
+status. `SAVED` and `APPLIED` are the pair worth checking — they are the live
+pipeline, and small (85 records on 2026-09-10, against 5730 `NOT_INTERESTED`).
+Add `REJECTED` when the question is whether a re-listing is worth a second try.
+
+**Where the descriptions come from.** `get_my_applications` returns a vacancy
+*summary*, and clustering is decided on descriptions; re-reading 85 of them
+through `get_vacancy` would spend exactly the context the free-text query in
+part 2 exists to save. So the command reads each one off its public onetap
+page, where an indexed posting carries a `schema.org/JobPosting` block, and
+caches the pages under `--cache`.
+
+A vacancy the candidate created themselves (`create_custom_vacancy`) has no
+public page and so no block. Those are **named in the output**, never guessed
+at — a record with no description merges only on an identical title, which is
+the one rule the Company C measurement says is wrong. Read them with `get_vacancy`
+and hand them back:
+
+```bash
+python3 $C/check.py pipeline --applications ... \
+        --descriptions '/tmp/custom.json'   # {"<vacancy id>": "description"}
+```
+
+**Nothing is written back.** Part 2 flips a fresh keeper because the candidate
+has not seen it yet; a status in the pipeline is one they set themselves, and
+changing it is their call. Report, recommend, and let them answer. What the
+report should say, per pair:
+
+- which record is the one to keep — the earlier `APPLIED` over a later `SAVED`,
+  because the application is the fact and the save is the accident
+- the containment, and what the descriptions actually differ on. A pair merging
+  at 0.99 on *different titles* is worth a sentence: Company I's `Node.js Developer`
+  and `Senior Backend Engineering, Content Creation` shared everything but one
+  line, which is either one posting re-listed or one template on two teams
+- for two `APPLIED` records, that there is nothing to withdraw. The second
+  application is already sent; `ARCHIVED` on the later one keeps the pipeline
+  honest and names where to track the reply
+
+Then apply what they agree to with `update_application_status`, one note each,
+naming the record it duplicates and the containment — an audit reading
+`NOT_INTERESTED` has to be able to tell a duplicate from a rejection.
 
 ---
 

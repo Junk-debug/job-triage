@@ -32,9 +32,13 @@ over-returns; the matching below is what makes it precise.
 """
 
 import argparse
+import html
 import json
+import os
 import re
 import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 
@@ -67,6 +71,44 @@ def clean(s):
 
 def company_key(name):
     return re.sub(r"\s+", " ", COMPANY_NOISE.sub(" ", clean(name))).strip()
+
+
+def acronym(name):
+    """The initials of a multi-word company name, or "" for a single word.
+
+    Taken from clean() rather than company_key(), because company_key strips
+    the very words the abbreviation keeps: "Acme Consulting Group" loses its
+    "group" to the suffix noise, and the acronym on the boards is ACG.
+    """
+    parts = clean(name).split()
+    return "".join(p[0] for p in parts) if len(parts) > 1 else ""
+
+
+def company_aliases(items):
+    """Resolve an agency's abbreviation onto its full name, within one batch.
+
+    "ACG" and "Acme Consulting Group" are one agency, and the pipeline
+    carried the same posting under both spellings — 0.990 containment on an
+    identical title, applied to twice a day apart. Nothing in the key
+    normalisation catches that, so the pair read as two agencies advertising
+    one end client's role and was reported instead of merged.
+
+    Only initials are resolved, only against a full name present in the same
+    batch, and only when exactly one full name claims them. An acronym that two
+    companies could answer to is left alone: a wrong merge costs a vacancy,
+    a missed one costs a line in the report.
+    """
+    keys, full = set(), {}
+    for i in items:
+        name = i.get("company")
+        if not name:
+            continue
+        keys.add(company_key(name))
+        a = acronym(name)
+        if a:
+            full.setdefault(a, set()).add(company_key(name))
+    return {k: next(iter(names)) for k, names in full.items()
+            if k in keys and len(names) == 1 and next(iter(names)) != k}
 
 
 def job_key(company, title):
@@ -157,9 +199,16 @@ def seniority_conflict(a, b):
     return bool(sa and sb and not (sa & sb))
 
 
-def compare(x, y, sx=None, sy=None):
-    """How two records in one batch relate: 'same', 'suspect', or None."""
-    if company_key(x.get("company")) != company_key(y.get("company")):
+def compare(x, y, sx=None, sy=None, cx=None, cy=None):
+    """How two records in one batch relate: 'same', 'suspect', or None.
+
+    `cx`/`cy` are the companies already resolved through company_aliases; they
+    default to the plain key, so a caller with a single pair need not build the
+    alias map.
+    """
+    cx = company_key(x.get("company")) if cx is None else cx
+    cy = company_key(y.get("company")) if cy is None else cy
+    if cx != cy:
         return None, 0.0
     if seniority_conflict(x.get("title"), y.get("title")):
         return None, 0.0
@@ -249,9 +298,13 @@ def build_clusters(items):
 
     # Only same-company pairs can be related, so compare inside those buckets
     # instead of across the whole batch.
+    alias = company_aliases(items)
+    company = [alias.get(company_key(r.get("company")), company_key(r.get("company")))
+               for r in items]
+
     buckets = {}
-    for i, rec in enumerate(items):
-        buckets.setdefault(company_key(rec.get("company")), []).append(i)
+    for i in range(len(items)):
+        buckets.setdefault(company[i], []).append(i)
 
     suspects = []
     for key, idxs in buckets.items():
@@ -261,7 +314,8 @@ def build_clusters(items):
             for b in range(a + 1, len(idxs)):
                 i, j = idxs[a], idxs[b]
                 verdict, score = compare(items[i], items[j],
-                                         shingle_cache[i], shingle_cache[j])
+                                         shingle_cache[i], shingle_cache[j],
+                                         company[i], company[j])
                 if verdict == "same":
                     union(i, j)
                 elif verdict == "suspect":
@@ -273,7 +327,7 @@ def build_clusters(items):
     agencies = []
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
-            if company_key(items[i].get("company")) == company_key(items[j].get("company")):
+            if company[i] == company[j]:
                 continue
             if not (shingle_cache[i] and shingle_cache[j]):
                 continue
@@ -729,10 +783,192 @@ def cmd_match(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+# --------------------------------------------------------------------------
+# the pipeline as a batch
+# --------------------------------------------------------------------------
+
+# get_my_applications returns a vacancy *summary* — no description — and
+# clustering is decided on descriptions. Re-reading 85 of them through
+# get_vacancy would spend the context the free-text query was designed to save,
+# so they are read off the public onetap page instead, where every indexed
+# posting carries a schema.org JobPosting block.
+LD_JSON = re.compile(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', re.S)
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
+     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+
+
+def untag(s):
+    s = re.sub(r"<(br|/p|/li|/h[1-6]|/div)[^>]*>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"[ \t]+", " ", html.unescape(s)).strip()
+
+
+def normalise_application(app):
+    """One get_my_applications record -> the batch shape cluster() reads."""
+    v = app.get("vacancy") or {}
+    sal = v.get("salary") or None
+    return {
+        "ref": f"onetap:{v['id']}",
+        "source": "onetap",
+        "source_id": v["id"],
+        "title": v.get("title"),
+        "company": v.get("companyName"),
+        "location": None,
+        "workplace": None,
+        "experience": None,
+        "employment": None,
+        "published_at": None,
+        "salary": {k: sal.get(k) for k in ("min", "max", "currency", "period")}
+                  if sal else None,
+        "salary_hints": [],
+        "keywords": [],
+        "description": None,
+        "link": v.get("link"),
+        # What the pipeline half of this skill exists to protect: the record's
+        # own status, and the note that says why it holds it.
+        "status": app.get("status"),
+        "application_id": app.get("id"),
+        "notes": app.get("notes") or None,
+        "applied_at": (app.get("updatedAt") or "")[:10] or None,
+        "board": ((v.get("source") or {}).get("sitemapJobPostingIndexingSourceData")
+                  or {}).get("name"),
+    }
+
+
+def page_description(rec, cache):
+    """Fill in a record's description from its onetap page. Cached on disk."""
+    path = os.path.join(cache, rec["source_id"] + ".html")
+    if not (os.path.exists(path) and os.path.getsize(path) > 2000):
+        if not rec.get("link"):
+            return "no link"
+        try:
+            req = urllib.request.Request(rec["link"], headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                body = r.read()
+        except Exception as e:                       # noqa: BLE001 — reported, not raised
+            return f"fetch failed: {e}"
+        with open(path, "wb") as f:
+            f.write(body)
+    page = open(path, encoding="utf-8", errors="replace").read()
+    for raw in LD_JSON.findall(page):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if d.get("@type") != "JobPosting":
+            continue
+        rec["description"] = untag(d.get("description") or "") or None
+        rec["published_at"] = rec["published_at"] or d.get("datePosted")
+        et = d.get("employmentType")
+        rec["employment"] = rec["employment"] or ([et] if isinstance(et, str) else et)
+        loc = d.get("jobLocation") or {}
+        if isinstance(loc, list):
+            loc = loc[0] if loc else {}
+        addr = loc.get("address") or {} if isinstance(loc, dict) else {}
+        rec["location"] = rec["location"] or addr.get("addressLocality") \
+                          or addr.get("addressRegion")
+        return None if rec["description"] else "empty description"
+    # A vacancy the candidate created themselves (create_custom_vacancy) has no
+    # public page to index, so it has no JobPosting block. Its description has
+    # to come from get_vacancy, through --descriptions.
+    return "no JobPosting block (custom vacancy?)"
+
+
+def cmd_pipeline(args):
+    """Turn the candidate's own applications into a batch, and cluster that.
+
+    The same question as part 1, asked of a different pile. `cluster` finds one
+    job served twice by two boards; this finds one job sitting twice in the
+    pipeline — saved again a month after it was applied to, or applied to twice
+    through two spellings of one agency. Both are answered by the same code:
+    this command only supplies the batch.
+
+    Nothing is written back. Flipping a status the candidate set themselves is
+    their call, not this script's, so the output is a report to act on.
+    """
+    items, seen = [], set()
+    for path in args.applications:
+        with open(path) as f:
+            payload = json.load(f)
+        rows = payload.get("applications", payload) if isinstance(payload, dict) else payload
+        for app in rows:
+            rec = normalise_application(app)
+            if rec["ref"] in seen:      # the same record under two status queries
+                continue
+            seen.add(rec["ref"])
+            items.append(rec)
+
+    supplied = {}
+    if args.descriptions:
+        with open(args.descriptions) as f:
+            supplied = json.load(f)
+    for rec in items:
+        text = supplied.get(rec["source_id"])
+        if text:
+            rec["description"] = text
+
+    why_missing = {}
+    if not args.no_fetch:
+        cache = args.cache or os.path.join(os.path.dirname(os.path.abspath(args.out or ".")),
+                                           "pages")
+        os.makedirs(cache, exist_ok=True)
+        todo = [r for r in items if not r["description"]]
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for rec, why in zip(todo, ex.map(lambda r: page_description(r, cache), todo)):
+                if why:
+                    why_missing[rec["source_id"]] = why
+
+    # Counted off the records themselves, not off the fetch: --no-fetch does no
+    # work and so reports no failures, and a run that silently called every
+    # description present would be exactly the wrong thing to trust.
+    missing = [(r["source_id"], r["company"], r["title"],
+                why_missing.get(r["source_id"], "not fetched"))
+               for r in items if not r["description"]]
+
+    batch = {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "source": "pipeline",
+        "count": len(items),
+        "without_description": [
+            {"id": i, "company": c, "title": t, "why": w} for i, c, t, w in missing
+        ],
+        "items": items,
+    }
+    text = json.dumps(batch, indent=2, ensure_ascii=False)
+    if args.out:
+        open(args.out, "w").write(text + "\n")
+        sys.stderr.write(f"{len(items)} applications -> {args.out}, "
+                         f"{len(items) - len(missing)} with a description\n")
+    else:
+        print(text)
+    if missing:
+        # Never judged on title alone: a record with no description merges only
+        # on an identical title, which is exactly the Company C case that is wrong.
+        sys.stderr.write("\nno description — read these with get_vacancy and pass "
+                         "them back as --descriptions '{\"<vacancy id>\": \"...\"}':\n")
+        for i, c, t, w in missing:
+            sys.stderr.write(f"  {i}  {c} / {t}  ({w})\n")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("pipeline",
+                        help="build a batch out of the candidate's own applications")
+    pl.add_argument("--applications", required=True, nargs="+",
+                    help="saved get_my_applications answers, one file per status")
+    pl.add_argument("--descriptions",
+                    help='{"<vacancy id>": "description"} for postings with no '
+                         "public page — custom vacancies, read with get_vacancy")
+    pl.add_argument("--cache", help="where to keep the fetched pages "
+                                    "(default: pages/ beside --out)")
+    pl.add_argument("--workers", type=int, default=6)
+    pl.add_argument("--no-fetch", action="store_true",
+                    help="use only what --descriptions supplies")
+    pl.add_argument("-o", "--out", help="write the batch here")
+    pl.set_defaults(func=cmd_pipeline)
 
     c = sub.add_parser("cluster", help="collapse duplicates inside one batch")
     c.add_argument("--batch", required=True, help="a triage.py batch")

@@ -15,11 +15,13 @@ through the `onetap` MCP server.
 - `.claude/skills/job-triage/triage.py` — normalises every source into one
   batch to judge, and routes the verdicts back to the right call.
 - `.claude/skills/applications-check/SKILL.md` — whether a job is already
-  known, in both senses: duplicated inside the batch (it clusters those before
-  judging, keeping the copy with the most information) and already in the
-  onetap pipeline (it flips those to `NOT_INTERESTED` after the gates). Invoke
-  with `/applications-check`; the triage run calls it at steps 3 and 7. The
-  measured thresholds live in that file — re-measure before changing one.
+  known, in three senses: duplicated inside the batch (it clusters those before
+  judging, keeping the copy with the most information), already in the onetap
+  pipeline (it flips those to `NOT_INTERESTED` after the gates), and held twice
+  by the pipeline itself (`check.py pipeline` builds a batch out of `SAVED` and
+  `APPLIED` and clusters that — same engine, no writes, a report to act on).
+  Invoke with `/applications-check`; the triage run calls it at steps 3 and 7.
+  The measured thresholds live in that file — re-measure before changing one.
 - `.claude/skills/job-triage/sources/` — one adapter per source, split into a
   read half and a write half. `linkedin.py` pulls postings from LinkedIn's
   public `jobs-guest` endpoints (no login, stdlib only); `linkedin_actions.py`
@@ -73,7 +75,10 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   (cross-company containment topped out at 0.060 across 1196 real pairs, so
   anything above 0.35 is flagged). Ask the candidate which agency to go
   through: applying via both can sink both applications. If they settle it as
-  a rule, that rule goes in `criteria.md`.
+  a rule, that rule goes in `criteria.md`. One spelling is resolved before the
+  flag fires: an abbreviation against the full name, when both are in the batch
+  and only one full name claims the initials — `ACG` and `Acme Consulting
+  Group` are one agency, and the pipeline had applied to their posting twice.
 - When the candidate corrects a verdict, update `criteria.md` so the correction
   survives the session.
 - One judgement, many sources. A source changes only how a vacancy is fetched
