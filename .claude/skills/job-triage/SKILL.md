@@ -27,14 +27,20 @@ A LinkedIn verdict lands in **three** places, and all three matter:
 | Verdict | On LinkedIn | On onetap | In the ledger |
 |---|---|---|---|
 | `SAVED` | bookmarked | `create_custom_vacancy` | recorded |
-| `NOT_INTERESTED` | **dismissed** — stops coming back in search | nothing | recorded |
+| `NOT_INTERESTED` | nothing by default — **dismissed only if the candidate asks** | nothing | recorded |
 | `UNDECIDED` | nothing | nothing | nothing — it resurfaces next run |
 | `UNREADABLE` | nothing — the posting is already gone | nothing | recorded |
 
 LinkedIn has no pipeline of its own, so survivors are written into onetap as
-custom vacancies and live in the normal pipeline from then on. Dismissing a
-rejection is what keeps the candidate's own LinkedIn feed usable — the ledger
-only stops *this script* from re-reading it, not LinkedIn from re-showing it.
+custom vacancies and live in the normal pipeline from then on.
+
+Dismissing a rejection is what keeps the candidate's own LinkedIn feed usable —
+the ledger only stops *this script* from re-reading it, not LinkedIn from
+re-showing it. But dismissing is **off by default and never assumed**. A sweep
+rejects thousands (2882 of 3039 on 2026-09-12), each dismissal is a write on
+the real account sent one at a time with its pause, and the candidate decided
+on 2026-09-12 that this is theirs to approve per run. Ask, and pass
+`--dismiss-rejections` only on a yes.
 
 ## Running one source, or all of them
 
@@ -212,6 +218,11 @@ questions that apply to this run's sources:
    "Judging in parallel" under step 5. Read sequentially, 375 postings took 35
    minutes on 2026-09-10. Agents cut the wall-clock; the extra cost is each
    one reading `criteria.md` on top of its share of the postings.
+3. **Dismiss the rejections on LinkedIn at the end?** Default **no**, and say
+   so when asking. A yes is one write per rejected posting — 2882 of them on
+   2026-09-12 — each sent on its own with a pause. Declining loses nothing: the
+   ledger already stops this script from re-reading them, and they can be
+   dismissed in a later pass. Only a yes earns `--dismiss-rejections` in step 8.
 
 If the candidate already said how in this request, use that and do not ask.
 
@@ -235,10 +246,43 @@ public `jobs-guest` endpoints. (Only the *writes* in step 5 need a session.)
 python3 $S/triage.py collect --source linkedin --max-age-days 7 --workers 2 -o /tmp/linkedin.json
 ```
 
-That runs search and fetch together, skipping the fetch when nothing is new.
-`--workers` is the answer from step 0 (default 1, capped at 4). It parallelises
-the description fetches only; the search itself stays one request at a time.
-Run the two halves separately when you want to inspect what came back first:
+That runs search and fetch **interleaved**: each query's new postings are
+fetched as soon as that query is searched. `--workers` is the answer from
+step 0 (default 1, capped at 4). It parallelises the description fetches only;
+the search itself stays one request at a time.
+
+**A run can be stopped at any point and loses nothing.** A full 14-day sweep
+was 4283 postings, ~3800 new, on 2026-09-11 — an hour or more — so this is
+built in, not an afterthought:
+
+- `/tmp/linkedin.json` is rewritten after every query and every 25
+  descriptions. At any moment it is a valid snapshot of complete, judgeable
+  records: `"complete"`, `queries_done`/`queries_total`, `queries_pending` and
+  `not_yet_fetched` say how far it got. `batch` it and start judging while the
+  rest is still coming in.
+- `/tmp/linkedin.json.run/` is the checkpoint: `state.json` after every search
+  page, `jobs.jsonl` a line per description.
+- **Ctrl-C / SIGTERM** (`kill -INT <pid>`, or stopping the background task)
+  finishes the requests in flight, writes the snapshot with
+  `"complete": false` and exits **130** — not a failure. A second Ctrl-C
+  aborts at once; even a `kill -9` loses only the request in flight.
+- **The same command again resumes**: finished queries are not searched again,
+  fetched postings are not fetched again. It refuses a checkpoint started with
+  different flags; `--fresh` discards one.
+- Postings judged into the ledger off an earlier snapshot are left out of the
+  output on resume (`judged_since_snapshot` counts them), so nothing is judged
+  twice.
+
+Progress streams live on stderr, the JSON summary goes to stdout — a line per
+page, a summary per query (`[7/21] … done: 68 postings, 12 new | so far 340
+seen, 120 new, 118 fetched | 9m14s | snapshot -> …`), and per description a
+percentage, the unreadable count and an ETA. Run it in the background with
+stderr sent to a log (`2> collect.log`) and `tail` that to report progress.
+The search has no ETA: a query's page count is unknown until it runs dry.
+
+The two halves also exist separately, when you want to inspect the search
+before spending the fetches. They are neither checkpointed nor resumable —
+prefer `collect` for a real run:
 
 ```bash
 python3 $S/sources/linkedin.py search --max-age-days 7 > /tmp/li-search.json
@@ -299,6 +343,16 @@ script:
 - `same_job_different_company` — two agencies advertising one end client's role.
   **Ask the candidate** which to go through; applying via both can sink both.
   Judge them separately until they answer.
+
+Both are computed **before** any verdict exists, since clustering has to run
+before judging to save the reads the merge tier above collapses. Neither band
+merges anything, though — every member is still read and judged individually —
+so what `cluster` reports here is raw and pre-verdict. On a real batch ~95%
+ends up `NOT_INTERESTED`, and most of these groups turn out to be entirely
+that: asking which agency to apply through, or flagging a "read as a set" note,
+is moot for a job nobody wants. Step 7's `match` re-filters both bands once
+every member has a verdict — report `suspected_duplicates_live` and
+`same_job_different_company_live` from there, not the raw counts from here.
 
 The full method, the measured thresholds and the reporting duties are in the
 `applications-check` skill.
@@ -422,6 +476,12 @@ flips whatever is already tracked to `NOT_INTERESTED` with a note naming what
 it duplicates, and writes `/tmp/verdicts.checked.json`. The same pass expands
 step 3's clusters, so every collapsed copy leaves with a verdict of its own.
 
+It also re-filters step 3's `suspected_duplicates` and
+`same_job_different_company`, now that every member has a final verdict:
+`suspected_duplicates_live` and `same_job_different_company_live` keep only
+the groups with a surviving member, dropping the ones that turned out
+entirely `NOT_INTERESTED`. Report from these, not from step 3's raw counts.
+
 Report every flip to the candidate. A keeper dropped silently is
 indistinguishable from a keeper that never existed.
 
@@ -455,16 +515,28 @@ from the batch automatically.
 
 #### Act on LinkedIn itself
 
-A verdict that only lives in this repo leaves the candidate's own LinkedIn feed
-full of jobs already rejected. `--apply-linkedin` closes that loop: every
-`SAVED` job is bookmarked and every `NOT_INTERESTED` job is dismissed.
+`--apply-linkedin` bookmarks every `SAVED` job on LinkedIn itself. It leaves
+the rejections alone:
 
 ```bash
 # see the calls first — these are writes on a real account
 python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.clustered.json \
         --apply-linkedin --dry-run
 
+# keepers bookmarked, rejections untouched
 python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.clustered.json --apply-linkedin
+```
+
+A verdict that only lives in this repo leaves the candidate's own LinkedIn feed
+full of jobs already rejected, and `--dismiss-rejections` is what closes that
+loop. **Never pass it unasked** — it is one write per rejection, and step 0's
+third question is where the candidate answers. `route` reports how many were
+held back as `linkedin_dismissals_withheld`, so the offer stays visible:
+
+```bash
+# only on an explicit yes
+python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.clustered.json \
+        --apply-linkedin --dismiss-rejections
 ```
 
 This is the one part of the LinkedIn source that needs a **login**. Set the
@@ -516,8 +588,8 @@ python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.cluster
 Do this last, and always — it is what makes the next run cheap. Rejections are
 recorded in the ledger and deliberately **not** pushed to onetap: several
 hundred rejections a week would cost a create call each and bury the real
-applications. They *are* dismissed on LinkedIn, which costs nothing and is
-where the candidate feels the difference.
+applications. Unless the candidate asked for the dismissals, the ledger is
+their **only** record, which is exactly why this step is not optional.
 
 ### 9. Notes discipline
 
@@ -542,12 +614,17 @@ in the stack, 12-month contract.
 ### 10. Report
 
 - how many were seen, how many were new, saved, rejected, per source
-- for LinkedIn, how many were bookmarked and dismissed on the site itself, and
-  any call that failed
+- for LinkedIn, how many were bookmarked on the site itself, how many
+  dismissals were sent or withheld (the default), and any call that failed
 - how many copies were collapsed in the batch, and which copy was kept
 - how many keepers were already in the pipeline, what each one duplicates, and
   the status it is tracked under — never drop one silently
-- every cross-company pair, as a question the candidate has to settle
+- every cross-company pair still live after verdicts
+  (`same_job_different_company_live` from step 7), as a question the
+  candidate has to settle — most cross-company pairs turn out entirely
+  rejected and are not worth asking about
+- every suspected-duplicate group still live after verdicts
+  (`suspected_duplicates_live` from step 7)
 - the saved ones as a list, each with company, title, salary, work model, and
   the **onetap** link — never the original job board or LinkedIn URL
 - every `UNDECIDED` item with the question you want answered
@@ -587,7 +664,8 @@ Undocumented HTML endpoints, changed without notice.
   changed (`show-more-less-html__markup`) or the guest view went behind an auth
   wall. Re-derive the selector from live HTML before touching anything else.
 - **Sustained HTTP 429** — the script backs off and retries four times. Beyond
-  that, stop and come back later; leave the ledger unwritten so nothing is lost.
+  that, stop the collect (Ctrl-C) and come back later: the same command resumes
+  from the checkpoint. Leave the ledger unwritten so nothing is lost.
 - **`--apply-linkedin` exits on 401/403/999** — the session died. `li_at`
   expires and `JSESSIONID` rotates on every logout, so re-copy both cookies.
   Judgements are unaffected: re-run `route` once the session is back.

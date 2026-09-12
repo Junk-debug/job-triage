@@ -61,6 +61,20 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   posted one title twice at 0.595) and neither is a high score alone (Company C's
   boilerplate carries different roles to 0.578). Everything between 0.50 and
   0.85 is reported and judged separately.
+- Neither the 0.50-0.85 band nor the cross-company band merges anything — both
+  members are always read and judged on their own, whatever band they land in.
+  So they cost nothing to defer: `cluster` reports them raw, before any verdict
+  exists, but `applications-check`'s `match` step re-filters both down to
+  `suspected_duplicates_live` / `same_job_different_company_live` once every
+  member has a verdict, dropping a group only when every member ended up
+  `NOT_INTERESTED` — on a 2026-09-12 sweep that was ~95% of the batch, so most
+  groups end up exactly that, and asking which agency to apply through for a
+  job nobody wants is moot. A ref with no verdict at all is never treated as
+  rejected, so a group is never dropped on missing information. Verified on
+  synthetic mixed-verdict groups and end-to-end on `linkedin/ledger.json`'s 467
+  judged records; the 2026-09-12 run's own raw batch (225 suspected groups, 288
+  cross-company pairs) was not kept, so the exact before/after at that scale
+  needs a fresh sweep.
 - The copy that survives a collapse is the one carrying the most information,
   not the first one seen — salary weighs most, because Gate 4 turns on it and
   most postings omit it. Of the real Company D pair only the Just Join IT copy stated
@@ -108,8 +122,14 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
   crossed and each cell is fired separately; the union is the feed. Check the
   cost with `search --dry-run` before spending it. Each cell pages **to the
   end** — there is no page cap, because the old 3-page one silently hid 374 of
-  402 postings on a broad query. A full sweep is ~600-900 requests; narrow it
-  with `--keyword`/`--location`, not with `--max-pages`.
+  402 postings on a broad query. A full 14-day sweep on 2026-09-11 saw 4283
+  postings, ~3800 new — an hour or more; narrow it with `--keyword`/`--location`,
+  not with `--max-pages`.
+- `collect` can be stopped at any point and resumed. Its output is rewritten
+  after every query (and every 25 descriptions) as a valid snapshot of complete
+  records, Ctrl-C/SIGTERM saves and exits 130, and the same command again
+  carries on from `<out>.run/`. Judge the snapshot while the rest comes in —
+  what reaches the ledger meanwhile is left out on resume.
 - On LinkedIn only **keywords, geoId/location and `f_TPR`** actually bite.
   `f_WT` is *proven ignored* — remote and on-site are mutually exclusive yet
   shared 30 of 50 results, more than the control. `f_E` is unreliable, `f_JT`
@@ -134,12 +154,15 @@ The candidate's rules live in `criteria.md`; this file does not repeat them.
 - Verdicts on LinkedIn jobs go in `linkedin/ledger.json` whichever way
   they fall. Rejections are deliberately not pushed to onetap — the ledger is
   their record, and it is what stops them coming back on the next run.
-- A LinkedIn verdict also has to reach LinkedIn: `route --apply-linkedin` saves
-  every keeper and **dismisses** every rejection on the site, so the candidate's
-  own feed stops showing what was already judged. The ledger only stops the
-  script from re-reading a job; only a dismiss stops LinkedIn re-showing it. A
-  keeper is therefore written twice — bookmarked on LinkedIn, and created as an
-  onetap custom vacancy.
+- A LinkedIn verdict also has to reach LinkedIn: `route --apply-linkedin`
+  bookmarks every keeper on the site. Rejections are **not** dismissed unless
+  `--dismiss-rejections` is passed, and that flag is **never passed unasked** —
+  a sweep rejects thousands (2882 of 3039 on 2026-09-12) and every dismissal is
+  its own throttled write, so the run asks up front and the default is no. The
+  ledger only stops the script from re-reading a job; only a dismiss stops
+  LinkedIn re-showing it, so offer it rather than assume it, and report how many
+  were withheld. A keeper is written twice — bookmarked on LinkedIn, and created
+  as an onetap custom vacancy.
 - Reading LinkedIn needs no login; writing to it needs `linkedin/session.json`
   with `li_at` and `jsessionid`. `JSESSIONID` **is** the csrf token, so both
   cookies are required and `li_at` alone gets a 403. Keep the two halves in
