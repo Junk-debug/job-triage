@@ -136,6 +136,35 @@ them can sink both applications. **Ask the candidate**, quote both companies
 and both links, and judge the postings separately until they answer. If they
 settle it as a general rule, that rule belongs in `criteria.md`.
 
+### Neither band is worth reporting before the verdicts are in
+
+`suspected_duplicates` and `same_job_different_company` are computed here,
+before anything is judged — clustering has to run before judging so the
+**merge** tier can save the reads it exists to save (see AUTO_MERGE above).
+But neither of these two bands merges anything: every member stays a separate
+`item`, gets read, and gets judged on its own regardless of which band it is
+in. So reporting them at cluster time reports groups whose fate nobody knows
+yet, and on a real run ~95% of any batch ends up `NOT_INTERESTED` — most
+suspected-duplicate groups and most cross-company pairs turn out to be about
+jobs nobody wants either way. "Which agency should I apply through" for a
+role both listings of which were rejected is not a question worth asking.
+
+So `cluster`'s counts here are raw and pre-verdict — read them as "found",
+not "to review". The report the candidate actually sees comes from `match`
+below, once every member has a final verdict: it filters both bands down to
+`suspected_duplicates_live` / `same_job_different_company_live`, keeping a
+group only if at least one member is not `NOT_INTERESTED` (a ref with no
+verdict at all counts as live too — never drop a group on missing
+information). Verified on synthetic mixed-verdict groups: an all-rejected
+group is dropped, a group with one `SAVED` or `UNDECIDED` survives, and a
+group with a ref missing its verdict survives. On the ledger's 467 already-
+judged records (no descriptions, so only the exact-title fallback merges —
+86 collapsed, 0 suspected/cross-company pairs found, since the containment
+bands need descriptions to compare) the mechanism runs end to end with no
+regressions; measuring the actual reduction in suspected/cross-company counts
+needs a fresh batch with descriptions, since the raw batch from the
+2026-09-12 run (225 suspected groups, 288 cross-company pairs) was not kept.
+
 ---
 
 ## Part 2 — is it already in the pipeline?
@@ -186,11 +215,18 @@ python3 $C/check.py match --verdicts /tmp/verdicts.json --batch /tmp/batch.clust
         --candidates /tmp/candidates.json -o /tmp/verdicts.checked.json
 ```
 
-This does two things. First it **expands the clusters**: every duplicate
+This does three things. First it **expands the clusters**: every duplicate
 collapsed in part 1 inherits its primary's verdict as `NOT_INTERESTED`, so it
 is dismissed on its own source and stops coming back. A duplicate is
 `NOT_INTERESTED` even when its primary is saved — one job belongs in the
 pipeline once.
+
+Second, now that every member of a `suspected_duplicates` group or a
+`same_job_different_company` pair has a final verdict, it **filters both
+bands** down to the groups actually worth reporting — see above. The result
+carries `suspected_duplicates_total` / `_live` and
+`same_job_different_company_total` / `_live`; report the `_live` lists to the
+candidate, not the raw ones from `cluster`.
 
 Then it matches the keepers against the pipeline, strongest evidence first:
 
@@ -285,8 +321,12 @@ silently is indistinguishable from a keeper that never existed.
   workplace
 - **already in the pipeline**: company, title, the existing status, and the
   onetap link of the record it duplicates
-- **suspected duplicates**: what was judged separately and why
-- **cross-company pairs**: as a question, with both links
+- **suspected duplicates**: `suspected_duplicates_live` from `match` — what
+  was judged separately and why, for the groups that still have a surviving
+  verdict. An all-`NOT_INTERESTED` group is not reported; it was judged
+  separately same as any other group, it just has nothing left to ask about.
+- **cross-company pairs**: `same_job_different_company_live` from `match`, as
+  a question, with both links — same filter, same reason.
 
 Two cases deserve calling out rather than listing:
 

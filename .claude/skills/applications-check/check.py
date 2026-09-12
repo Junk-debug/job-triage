@@ -415,6 +415,35 @@ def load_duplicates(path):
         return json.load(f).get("duplicates", [])
 
 
+def load_batch_groups(path):
+    """The suspected/cross-company groups cluster() found, or empty for a
+    batch that was never clustered (or predates this field)."""
+    if not path:
+        return [], []
+    with open(path) as f:
+        b = json.load(f)
+    return b.get("suspected_duplicates") or [], b.get("same_job_different_company") or []
+
+
+def group_is_live(refs, verdict_by_ref):
+    """Does this group still matter once every member has a verdict?
+
+    Both suspected_duplicates and same_job_different_company are reported
+    at cluster time, before any verdict exists - clustering happens before
+    judging on purpose, to save the reads a real merge collapses (see
+    AUTO_MERGE above). But neither band actually merges anything: every
+    member is read and judged on its own regardless, so nothing is lost by
+    asking the candidate about a group only after its members are judged -
+    and most groups turn out to be entirely NOT_INTERESTED, at which point
+    "which agency should I apply through" or "read these as a set" is a
+    question about a job nobody wants.
+
+    A ref missing a verdict counts as live rather than rejected - never drop
+    a group because of a gap that should have failed `merge` earlier.
+    """
+    return any(verdict_by_ref.get(r) != "NOT_INTERESTED" for r in refs)
+
+
 def keepers(verdicts, batch):
     """The verdicts this check applies to: the ones that survived the gates.
 
@@ -639,9 +668,11 @@ def cmd_cluster(args):
     if args.out:
         open(args.out, "w").write(text + "\n")
         sys.stderr.write(f"{len(items)} records -> {len(primaries)} to judge, "
-                         f"{len(duplicates)} collapsed, {len(suspected)} suspected, "
-                         f"{len(cross_company)} cross-company to ask about "
-                         f"-> {args.out}\n")
+                         f"{len(duplicates)} collapsed, {len(suspected)} suspected "
+                         f"and {len(cross_company)} cross-company group(s) found "
+                         f"pre-verdict -> {args.out}. Neither band merges anything, "
+                         f"so report only what `match` says is still live once "
+                         f"the primaries are judged.\n")
         summary = {k: out[k] for k in ("to_judge", "collapsed", "clusters",
                                        "suspected_duplicates",
                                        "same_job_different_company")}
@@ -760,6 +791,16 @@ def cmd_match(args):
                      was="SAVED", duplicate=True)
         out_verdicts.append(v)
 
+    # Every verdict is final at this point - cluster expansion and the
+    # pipeline flips above are both applied - so this is the one place that
+    # can tell a suspected-duplicate group or a cross-company pair that turned
+    # out to be all NOT_INTERESTED from one worth still asking about.
+    verdict_by_ref = {v.get("ref"): v.get("verdict") for v in out_verdicts}
+    suspected, cross_company = load_batch_groups(args.batch)
+    live_suspected = [g for g in suspected if group_is_live(g["refs"], verdict_by_ref)]
+    live_cross_company = [g for g in cross_company
+                          if group_is_live(g["pair"], verdict_by_ref)]
+
     result = {
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "cluster_duplicates_expanded": len(expanded),
@@ -768,6 +809,10 @@ def cmd_match(args):
         "duplicates_found": len(hits),
         "still_keepers": len(ks) - len(hits),
         "hits": hits,
+        "suspected_duplicates_total": len(suspected),
+        "suspected_duplicates_live": live_suspected,
+        "same_job_different_company_total": len(cross_company),
+        "same_job_different_company_live": live_cross_company,
         "truncated_queries": truncated,
         "verdicts": out_verdicts,
     }
@@ -780,6 +825,13 @@ def cmd_match(args):
         sys.stderr.write(f"WARNING: {len(truncated)} query(s) returned only part of "
                          f"their matches — narrow them and re-run before trusting "
                          f"a clean result\n")
+    if suspected or cross_company:
+        sys.stderr.write(f"{len(suspected)} suspected-duplicate group(s) -> "
+                         f"{len(live_suspected)} still live once NOT_INTERESTED-only "
+                         f"groups drop out; {len(cross_company)} cross-company "
+                         f"pair(s) -> {len(live_cross_company)} still live. Report "
+                         f"only the live ones — the rest are jobs nobody wants either "
+                         f"way.\n")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
