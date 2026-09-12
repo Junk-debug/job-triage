@@ -196,9 +196,9 @@ class Session:
         return None, None
 
 
-def polite():
+def polite(lo=1.2, hi=2.6):
     """These are writes on a real account. Do not machine-gun them."""
-    time.sleep(random.uniform(1.2, 2.6))
+    time.sleep(random.uniform(lo, hi))
 
 
 # --------------------------------------------------------------------------
@@ -251,12 +251,12 @@ def save_state(sess, job_id, saved):
             "saved": bool(saved), "ok": status in (200, 204)}
 
 
-def run_batch(sess, jobs, fn, label):
+def run_batch(sess, jobs, fn, label, pause=polite):
     """Apply one action across job ids, one at a time, and report each."""
     results = []
     for i, jid in enumerate(jobs):
         if i:
-            polite()
+            pause()
         r = fn(sess, str(jid))
         results.append(r)
         mark = "dry" if r.get("dry_run") else ("ok" if r.get("ok") else "FAILED")
@@ -312,7 +312,8 @@ def cmd_undo_dismiss(args):
 def cmd_save(args):
     sess = session_from(args)
     report(run_batch(sess, args.job_ids,
-                     lambda s, j: save_state(s, j, True), "save"))
+                     lambda s, j: save_state(s, j, True), "save",
+                     pause=lambda: polite(2.0, 5.0)))
 
 
 def cmd_unsave(args):
@@ -350,9 +351,10 @@ def cmd_apply(args):
                      f"{len(skipped)} left alone\n")
     sess = session_from(args)
     results = []
-    results += run_batch(sess, to_save, lambda s, j: save_state(s, j, True), "save")
+    results += run_batch(sess, to_save, lambda s, j: save_state(s, j, True), "save",
+                         pause=lambda: polite(2.0, 5.0))
     if to_save and to_dismiss:
-        polite()
+        polite(2.0, 5.0)
     results += run_batch(sess, to_dismiss,
                          lambda s, j: feedback(s, j, "dismiss"), "dismiss")
 
