@@ -8,6 +8,8 @@ ones that serve LinkedIn's logged-out job pages, and they answer plain HTML:
   jobPosting/<jobId>         -> one full posting, description included
 
 Subcommands
+  collect  search and fetch together, interruptible and resumable — the one
+           to use for a real run (see cmd_collect)
   search   run the configured queries, drop anything already in the ledger,
            print the new job ids as JSON
   fetch    fetch full postings for job ids, print them as JSON
@@ -24,6 +26,7 @@ import json
 import os
 import random
 import re
+import signal
 import sys
 import threading
 import time
@@ -56,6 +59,7 @@ STALL_PAGES = 2         # consecutive all-repeat pages before calling it done
 # is never exposed, but the IP is the one the candidate's browser uses and
 # LinkedIn throttles bursts - so the ceiling stays low whatever is asked for.
 MAX_FETCH_WORKERS = 4
+SNAPSHOT_EVERY = 25     # collect rewrites its output after this many descriptions
 
 
 # --------------------------------------------------------------------------
@@ -123,9 +127,22 @@ def get(url, tries=4, timeout=30):
     return None
 
 
-def polite():
-    """LinkedIn throttles hard on bursts. Space the calls out."""
-    time.sleep(random.uniform(1.1, 2.4))
+def polite(stop=None):
+    """LinkedIn throttles hard on bursts. Space the calls out.
+
+    With a `stop` event the pause ends as soon as the run is interrupted.
+    """
+    delay = random.uniform(1.1, 2.4)
+    if stop is None:
+        time.sleep(delay)
+    else:
+        stop.wait(delay)
+
+
+def fmt_duration(seconds):
+    """12m05s — for progress lines on runs that take half an hour."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
 
 
 # --------------------------------------------------------------------------
@@ -228,7 +245,7 @@ def resolve_pages(cli_cap, cfg_cap):
     return min(caps) if caps else None
 
 
-def run_search(query, max_pages=None, verbose=True):
+def run_search(query, max_pages=None, verbose=True, resume=None, on_page=None, stop=None):
     """Page through one configured query until it runs dry.
 
     max_pages=None means "to the end", which is the intended mode: the depth of
@@ -245,12 +262,21 @@ def run_search(query, max_pages=None, verbose=True):
                          exhausted. One such page is normal and is pushed
                          through; STALL_PAGES in a row means the endpoint is
                          out of new results.
+
+    For an interruptible run: `on_page` is handed {"start", "stalled", "found"}
+    after every page — the position to carry on from — and that same dict comes
+    back as `resume` to pick an interrupted query up where it stopped. A set
+    `stop` event ends the paging early; the caller tells that apart from a
+    finished query by checking the event.
     """
     params = {k: v for k, v in query.get("params", {}).items() if v not in (None, "")}
-    found = {}
-    stalled = 0
+    found = dict(resume["found"]) if resume else {}
+    stalled = resume["stalled"] if resume else 0
+    first_page = resume["start"] // PAGE_SIZE if resume else 0
     limit = MAX_PAGES if max_pages is None else min(max_pages, MAX_PAGES)
-    for page in range(limit):
+    for page in range(first_page, limit):
+        if stop is not None and stop.is_set():
+            break
         start = page * PAGE_SIZE
         if start > MAX_START:
             break
@@ -270,9 +296,11 @@ def run_search(query, max_pages=None, verbose=True):
             sys.stderr.write(f"  [{query['name']}] start={start} cards={len(cards)} "
                              f"new={fresh} total={len(found)}\n")
         stalled = stalled + 1 if fresh == 0 else 0
+        if on_page:
+            on_page({"start": start + PAGE_SIZE, "stalled": stalled, "found": found})
         if stalled >= STALL_PAGES:
             break
-        polite()
+        polite(stop)
     return list(found.values())
 
 
@@ -425,6 +453,51 @@ def expand_queries(filters):
     return out, collapsed
 
 
+def age_cutoff(max_age_days):
+    if not max_age_days:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+
+def is_stale(card, cutoff):
+    if cutoff is None or not card.get("posted_at"):
+        return False
+    try:
+        d = datetime.fromisoformat(card["posted_at"]).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return d < cutoff
+
+
+def absorb(query, cards, seen, new, known, cutoff, tally):
+    """Fold one query's cards into the union of the matrix.
+
+    A posting found by several cells is one record whose `queries` names them
+    all. It is new only when the ledger has not judged it and it is inside the
+    age window. `tally` counts "already_judged" and "stale" across calls.
+    Returns how many postings this query added to `new`.
+    """
+    added = 0
+    for card in cards:
+        jid = card["job_id"]
+        if jid in seen:
+            if query["name"] not in seen[jid]["queries"]:
+                seen[jid]["queries"].append(query["name"])
+            continue
+        card["queries"] = [query["name"]]
+        card["expected_workplace"] = query["expected_workplace"]
+        card["location_group"] = query["location_group"]
+        seen[jid] = card
+        if jid in known:
+            tally["already_judged"] += 1
+        elif is_stale(card, cutoff):
+            tally["stale"] += 1
+        else:
+            new[jid] = card
+            added += 1
+    return added
+
+
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -469,36 +542,18 @@ def cmd_search(args):
     sys.stderr.write(f"{len(queries)} queries "
                      f"({collapsed} collapsed as duplicate requests)\n")
     seen, new = {}, {}
+    tally = {"already_judged": 0, "stale": 0}
+    cutoff = age_cutoff(args.max_age_days)
+    started = time.monotonic()
     for n, q in enumerate(queries, 1):
         sys.stderr.write(f"[{n}/{len(queries)}] {q['name']}\n")
         pages = resolve_pages(args.max_pages, q["max_pages"])
-        for card in run_search(q, pages):
-            jid = card["job_id"]
-            if jid in seen:
-                seen[jid]["queries"].append(q["name"])
-                continue
-            card["queries"] = [q["name"]]
-            card["expected_workplace"] = q["expected_workplace"]
-            card["location_group"] = q["location_group"]
-            seen[jid] = card
-            if jid not in known:
-                new[jid] = card
-
-    stale = None
-    if args.max_age_days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=args.max_age_days)
-        stale = []
-        for jid, c in list(new.items()):
-            p = c.get("posted_at")
-            if not p:
-                continue
-            try:
-                d = datetime.fromisoformat(p).replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            if d < cutoff:
-                stale.append(jid)
-                del new[jid]
+        cards = run_search(q, pages)
+        added = absorb(q, cards, seen, new, known, cutoff, tally)
+        # No ETA: a query's page count is unknown until it runs dry.
+        sys.stderr.write(f"[{n}/{len(queries)}] {q['name']} done: {len(cards)} postings, "
+                         f"{added} new here | so far {len(seen)} seen, {len(new)} new | "
+                         f"{fmt_duration(time.monotonic() - started)}\n")
 
     per_group = {}
     for c in new.values():
@@ -511,8 +566,8 @@ def cmd_search(args):
         "queries_collapsed": collapsed,
         "new_per_location_group": per_group,
         "total_seen": len(seen),
-        "already_judged": len(seen) - len(new) - (len(stale) if stale else 0),
-        "dropped_as_stale": len(stale) if stale else 0,
+        "already_judged": tally["already_judged"],
+        "dropped_as_stale": tally["stale"],
         "new_count": len(new),
         "new": sorted(new.values(), key=lambda c: c.get("posted_at") or "", reverse=True),
     }
@@ -657,6 +712,53 @@ def cmd_sync_filters(args):
 CARRY_OVER = ("posted_at", "expected_workplace", "location_group", "queries")
 
 
+def carry_over(job, card):
+    """Copy onto a fetched posting what only its search card knows."""
+    for k in CARRY_OVER:
+        if card and card.get(k) is not None:
+            job[k] = card[k]
+    return job
+
+
+def fetch_many(ids, cards, workers, stop=None, on_job=None):
+    """Fetch postings in parallel and hand them back in input order.
+
+    `on_job` is called with each posting as it lands, under a lock, so a
+    caller can checkpoint it. Once `stop` is set, workers take no new ids;
+    those come back as None.
+    """
+    workers = max(1, min(workers, MAX_FETCH_WORKERS))
+    progress = {"done": 0, "failed": 0}
+    lock = threading.Lock()
+    started = time.monotonic()
+
+    def one(jid):
+        if stop is not None and stop.is_set():
+            return None
+        job = carry_over(fetch_posting(jid), cards.get(jid))
+        with lock:
+            progress["done"] += 1
+            if not job.get("ok"):
+                progress["failed"] += 1
+            done = progress["done"]
+            elapsed = time.monotonic() - started
+            eta = elapsed / done * (len(ids) - done)
+            sys.stderr.write(f"  [{done}/{len(ids)} {done * 100 // len(ids)}%] {jid} "
+                             f"{'ok' if job.get('ok') else 'UNREADABLE'} | "
+                             f"{progress['failed']} unreadable | "
+                             f"{fmt_duration(elapsed)} elapsed, eta {fmt_duration(eta)}\n")
+            if on_job:
+                on_job(job)
+        # Every worker keeps its own pause, so N workers run at about N times
+        # the single-worker rate - never a burst.
+        polite(stop)
+        return job
+
+    # map() hands the results back in input order, whatever order they finish in.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, ids))
+
+
 def cmd_fetch(args):
     ids = list(args.job_ids)
     cards = {}
@@ -670,27 +772,7 @@ def cmd_fetch(args):
         ids = ids[:args.limit]
 
     workers = max(1, min(args.workers, MAX_FETCH_WORKERS))
-    progress = {"done": 0}
-    lock = threading.Lock()
-
-    def one(jid):
-        job = fetch_posting(jid)
-        card = cards.get(jid)
-        if card:
-            for k in CARRY_OVER:
-                if card.get(k) is not None:
-                    job[k] = card[k]
-        with lock:
-            progress["done"] += 1
-            sys.stderr.write(f"  [{progress['done']}/{len(ids)}] {jid}\n")
-        # Every worker keeps its own pause, so N workers run at about N times
-        # the single-worker rate - never a burst.
-        polite()
-        return job
-
-    # map() hands the results back in input order, whatever order they finish in.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = list(pool.map(one, ids))
+    jobs = fetch_many(ids, cards, workers)
 
     ok = [j for j in jobs if j.get("ok")]
     print(json.dumps({
@@ -701,6 +783,230 @@ def cmd_fetch(args):
         "failed": len(jobs) - len(ok),
         "jobs": jobs,
     }, indent=2, ensure_ascii=False))
+
+
+def write_json_atomic(path, data):
+    """Write through a temp file, so an interrupted write never leaves half a file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_fetched(path):
+    """The postings a run has already fetched, one JSON object per line."""
+    fetched = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    job = json.loads(line)
+                except ValueError:
+                    continue      # a line cut short by a hard kill
+                fetched[job["job_id"]] = job
+    return fetched
+
+
+def cmd_collect(args):
+    """Search and fetch as one run that can be stopped at any point.
+
+    A full sweep is thousands of requests and most of an hour, so it has to
+    survive being stopped part-way without losing what it has done:
+
+      interleaved   each query's new postings are fetched as soon as that query
+                    is searched, so a stopped run already holds complete,
+                    judgeable records for every query it finished — not a pile
+                    of search cards with no descriptions.
+      checkpointed  <run>/state.json is rewritten after every search page and
+                    <run>/jobs.jsonl gains a line per description, so even a
+                    hard kill loses at most the request in flight. The output
+                    file is rewritten after every query: it is a valid
+                    snapshot to batch and judge at any moment.
+      stoppable     Ctrl-C or SIGTERM finishes the requests in flight, writes
+                    the output with "complete": false and exits 130. A second
+                    Ctrl-C aborts at once; the checkpoint still holds.
+      resumable     the same command again carries on from the checkpoint —
+                    finished queries are not searched again, fetched postings
+                    are not fetched again. --fresh discards it.
+
+    Postings judged into the ledger while the run was stopped are left out of
+    the output when it resumes, so a snapshot judged early is not judged twice.
+    """
+    filters = load_filters()
+    queries, collapsed = expand_queries(filters)
+    if args.location:
+        queries = [q for q in queries if q["location_group"] in args.location]
+    if args.keyword:
+        queries = [q for q in queries if q["keyword"] in args.keyword]
+    if args.query:
+        queries = [q for q in queries if q["name"] in args.query]
+    if not queries:
+        sys.exit("no queries left after filtering — check --location / --keyword / --query")
+
+    run_dir = args.state or args.out + ".run"
+    state_path = os.path.join(run_dir, "state.json")
+    jobs_path = os.path.join(run_dir, "jobs.jsonl")
+    fingerprint = {"queries": [q["name"] for q in queries],
+                   "max_age_days": args.max_age_days, "max_pages": args.max_pages}
+
+    state = None
+    if os.path.exists(state_path) and not args.fresh:
+        with open(state_path) as f:
+            old = json.load(f)
+        if old.get("complete"):
+            pass                  # that run finished; this is a new one
+        elif old.get("fingerprint") != fingerprint:
+            sys.exit(f"{run_dir} holds an unfinished run with different queries or "
+                     f"flags. Re-run with the flags it was started with to resume "
+                     f"it, or pass --fresh to discard it.")
+        else:
+            state = old
+    if state is None:
+        os.makedirs(run_dir, exist_ok=True)
+        for p in (state_path, jobs_path):
+            if os.path.exists(p):
+                os.remove(p)
+        state = {"fingerprint": fingerprint,
+                 "started_at": datetime.now(timezone.utc).isoformat(),
+                 "complete": False, "searched": [], "current": None,
+                 "seen": {}, "new": [], "tally": {"already_judged": 0, "stale": 0}}
+    fetched = load_fetched(jobs_path)
+    if state["searched"] or state["current"] or fetched:
+        sys.stderr.write(f"resuming {run_dir}: {len(state['searched'])}/{len(queries)} "
+                         f"queries searched, {len(fetched)} postings already fetched\n")
+
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        if stop.is_set():
+            raise KeyboardInterrupt
+        stop.set()
+        sys.stderr.write("\nstopping: finishing the requests in flight, then saving. "
+                         "Press Ctrl-C again to abort at once.\n")
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    seen = state["seen"]
+    new = {jid: seen[jid] for jid in state["new"]}
+    known = load_ledger()["jobs"]
+    cutoff = age_cutoff(args.max_age_days)
+    jobs_file = open(jobs_path, "a")
+    started = time.monotonic()
+
+    def save_state():
+        state["new"] = list(new)
+        write_json_atomic(state_path, state)
+
+    def write_output():
+        # The ledger is re-read: whatever was judged off an earlier snapshot of
+        # this run is not handed out a second time.
+        judged = load_ledger()["jobs"]
+        jobs, judged_since = [], 0
+        for jid, card in new.items():
+            if jid not in fetched:
+                continue
+            if jid in judged:
+                judged_since += 1
+                continue
+            jobs.append(carry_over(dict(fetched[jid]), card))
+        jobs.sort(key=lambda j: j.get("posted_at") or "", reverse=True)
+        ok = sum(1 for j in jobs if j.get("ok"))
+        result = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "complete": state["complete"],
+            "queries_done": len(state["searched"]),
+            "queries_total": len(queries),
+            "queries_pending": [q["name"] for q in queries
+                                if q["name"] not in state["searched"]],
+            "total_seen": len(seen),
+            "already_judged": state["tally"]["already_judged"],
+            "dropped_as_stale": state["tally"]["stale"],
+            "new_count": len(new),
+            "not_yet_fetched": sum(1 for jid in new if jid not in fetched),
+            "judged_since_snapshot": judged_since,
+            "requested": len(jobs),
+            "ok": ok,
+            "failed": len(jobs) - ok,
+            "jobs": jobs,
+        }
+        write_json_atomic(args.out, result)
+        return result
+
+    def on_job(job):
+        fetched[job["job_id"]] = job
+        jobs_file.write(json.dumps(job, ensure_ascii=False) + "\n")
+        jobs_file.flush()
+        # One query can bring hundreds of new postings; keep the snapshot
+        # current inside the fetch too, not only between queries.
+        if len(fetched) % SNAPSHOT_EVERY == 0:
+            write_output()
+
+    def fetch_pending():
+        pending = [jid for jid in new if jid not in fetched]
+        if pending and not stop.is_set():
+            sys.stderr.write(f"  fetching {len(pending)} description(s)\n")
+            fetch_many(pending, new, args.workers, stop=stop, on_job=on_job)
+
+    try:
+        # A run stopped during a fetch picks that up before searching further.
+        fetch_pending()
+        for n, q in enumerate(queries, 1):
+            if stop.is_set():
+                break
+            if q["name"] in state["searched"]:
+                continue
+            resume = None
+            if state["current"] and state["current"]["name"] == q["name"]:
+                resume = state["current"]
+                sys.stderr.write(f"[{n}/{len(queries)}] {q['name']} "
+                                 f"(resuming at start={resume['start']})\n")
+            else:
+                sys.stderr.write(f"[{n}/{len(queries)}] {q['name']}\n")
+
+            def on_page(pos, name=q["name"]):
+                state["current"] = {"name": name, **pos}
+                save_state()
+
+            cards = run_search(q, resolve_pages(args.max_pages, q["max_pages"]),
+                               resume=resume, on_page=on_page, stop=stop)
+            if stop.is_set():
+                break         # state["current"] already holds the position
+            added = absorb(q, cards, seen, new, known, cutoff, state["tally"])
+            state["searched"].append(q["name"])
+            state["current"] = None
+            save_state()
+
+            fetch_pending()
+            result = write_output()
+            sys.stderr.write(
+                f"[{n}/{len(queries)}] {q['name']} done: {len(cards)} postings, "
+                f"{added} new | so far {len(seen)} seen, {len(new)} new, "
+                f"{len(new) - result['not_yet_fetched']} fetched | "
+                f"{fmt_duration(time.monotonic() - started)} | snapshot -> {args.out}\n")
+        else:
+            fetch_pending()
+            if not stop.is_set() and all(jid in fetched for jid in new):
+                state["complete"] = True
+    finally:
+        jobs_file.close()
+        save_state()
+        result = write_output()
+
+    summary = {k: result[k] for k in (
+        "complete", "queries_done", "queries_total", "total_seen", "already_judged",
+        "dropped_as_stale", "new_count", "not_yet_fetched", "judged_since_snapshot",
+        "ok", "failed")}
+    summary.update({"out": args.out, "checkpoint": run_dir})
+    print(json.dumps(summary, indent=2))
+    if not result["complete"]:
+        sys.stderr.write(f"stopped before the end — {args.out} holds what was done. "
+                         f"Run the same command again to carry on.\n")
+        sys.exit(130)
 
 
 def cmd_record(args):
@@ -770,6 +1076,24 @@ def main():
                         "truncates (measured: a 3-page cap saw 28 of 402 postings)")
     s.add_argument("--max-age-days", type=int, default=None, help="drop cards older than this")
     s.set_defaults(func=cmd_search)
+
+    c = sub.add_parser("collect", help="search + fetch as one interruptible, resumable run")
+    c.add_argument("-o", "--out", required=True,
+                   help="the fetched postings; rewritten after every query, so it is "
+                        "always a usable snapshot")
+    c.add_argument("--state", default=None,
+                   help="checkpoint directory (default: <out>.run)")
+    c.add_argument("--fresh", action="store_true",
+                   help="discard an unfinished checkpoint instead of resuming it")
+    c.add_argument("--query", action="append", help="run only this expanded cell (repeatable)")
+    c.add_argument("--location", action="append", help="run only this location group (repeatable)")
+    c.add_argument("--keyword", action="append", help="run only this keyword (repeatable)")
+    c.add_argument("--max-pages", type=int, default=None,
+                   help="cap pages per query — for sampling only, see `search --help`")
+    c.add_argument("--max-age-days", type=int, default=None, help="drop cards older than this")
+    c.add_argument("--workers", type=int, default=1,
+                   help=f"parallel description fetches, capped at {MAX_FETCH_WORKERS} (default 1)")
+    c.set_defaults(func=cmd_collect)
 
     f = sub.add_parser("fetch", help="fetch full postings")
     f.add_argument("job_ids", nargs="*")

@@ -181,6 +181,10 @@ def cmd_batch(args):
 def cmd_collect(args):
     """Run a source's own fetch end to end, so a single-source run is one call.
 
+    For LinkedIn that is `linkedin.py collect`: interruptible, checkpointed and
+    resumable — see its docstring. Running this again with the same flags
+    carries on where a stopped run left off.
+
     Only sources with a local fetcher can be collected this way. onetap comes
     through MCP tools the agent calls itself, so it has nothing to run here —
     save the search_vacancies response to a file and pass it to `batch`.
@@ -188,12 +192,14 @@ def cmd_collect(args):
     if args.source != "linkedin":
         sys.exit(f"'{args.source}' has no local fetcher — see `batch --help`")
 
-    search_out = args.out + ".search.json"
-    cmd = [sys.executable, LINKEDIN, "search"]
+    cmd = [sys.executable, LINKEDIN, "collect", "-o", args.out,
+           "--workers", str(args.workers)]
     if args.max_age_days:
         cmd += ["--max-age-days", str(args.max_age_days)]
     if args.max_pages:
         cmd += ["--max-pages", str(args.max_pages)]
+    if args.fresh:
+        cmd += ["--fresh"]
     for q in args.query or []:
         cmd += ["--query", q]
     for l in args.location or []:
@@ -201,38 +207,10 @@ def cmd_collect(args):
     for k in args.keyword or []:
         cmd += ["--keyword", k]
 
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    sys.stderr.write(p.stderr)
-    if p.returncode != 0:
-        sys.exit("search failed")
-    open(search_out, "w").write(p.stdout)
-    found = json.loads(p.stdout)
-
-    if not found["new_count"]:
-        sys.stderr.write("nothing new — no fetch needed\n")
-        open(args.out, "w").write(json.dumps(
-            {"requested": 0, "ok": 0, "failed": 0, "jobs": []}, indent=2) + "\n")
-        print(json.dumps({"new_count": 0, "fetched": 0, "out": args.out}, indent=2))
-        return
-
-    cmd = [sys.executable, LINKEDIN, "fetch", "--from-search", search_out,
-           "--workers", str(args.workers)]
-    if args.limit:
-        cmd += ["--limit", str(args.limit)]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    sys.stderr.write(p.stderr)
-    if p.returncode != 0:
-        sys.exit("fetch failed")
-    open(args.out, "w").write(p.stdout)
-    got = json.loads(p.stdout)
-
-    print(json.dumps({
-        "new_count": found["new_count"],
-        "already_judged": found["already_judged"],
-        "fetched": got["ok"],
-        "unreadable": got["failed"],
-        "out": args.out,
-    }, indent=2))
+    # exec, not a subprocess: the run is linkedin.py's own, so Ctrl-C and
+    # SIGTERM reach it directly and it can checkpoint before it exits.
+    sys.stdout.flush()
+    os.execv(sys.executable, cmd)
 
 
 def cmd_sources(args):
@@ -252,8 +230,8 @@ def cmd_sources(args):
             "filters": "saved server-side; useSavedFilters=true",
         },
         "linkedin": {
-            "collect": f"python3 {os.path.relpath(LINKEDIN)} search|fetch, "
-                       f"or triage.py collect --source linkedin",
+            "collect": "triage.py collect --source linkedin — interruptible, "
+                       "resumable; the same command again carries on",
             "already_judged": f"linkedin/ledger.json ({judged} recorded)",
             "write": "save/dismiss on LinkedIn (route --apply-linkedin) "
                      "+ create_custom_vacancy for keepers + ledger",
@@ -360,12 +338,23 @@ def cmd_route(args):
     if args.only:
         result["counts"]["skipped_other_sources"] = skipped
 
-    if linkedin_actions and args.apply_linkedin:
+    # Dismissals are opt-in. One sweep rejects thousands of postings, and every
+    # dismissal is a write on the candidate's real account, sent one at a time
+    # with its pause — hours of writes for the largest group in the batch. So
+    # --apply-linkedin bookmarks the keepers and leaves the rejections alone;
+    # the ledger is already their record, and it is what stops this script
+    # re-reading them. Ask the candidate before passing --dismiss-rejections.
+    to_send = [a for a in linkedin_actions
+               if a["action"] == "save" or args.dismiss_rejections]
+    withheld = len(linkedin_actions) - len(to_send)
+    result["counts"]["linkedin_dismissals_withheld"] = withheld
+
+    if to_send and args.apply_linkedin:
         cmd = [sys.executable, LINKEDIN_ACTIONS]
         if args.dry_run:
             cmd.append("--dry-run")
         p = subprocess.run(cmd + ["apply", "-"],
-                           input=json.dumps(linkedin_actions), text=True,
+                           input=json.dumps(to_send), text=True,
                            capture_output=True)
         sys.stderr.write(p.stderr)
         try:
@@ -381,9 +370,14 @@ def cmd_route(args):
                 rec["linkedin_action"] = done[rec["job_id"]]
         if p.returncode != 0:
             sys.stderr.write("NOTE: some LinkedIn actions failed — see linkedin_applied\n")
-    elif linkedin_actions:
-        sys.stderr.write(f"NOTE: {len(linkedin_actions)} LinkedIn save/dismiss calls NOT "
-                         f"sent (pass --apply-linkedin)\n")
+    elif to_send:
+        sys.stderr.write(f"NOTE: {len(to_send)} LinkedIn calls NOT sent "
+                         f"(pass --apply-linkedin)\n")
+
+    if withheld:
+        sys.stderr.write(f"NOTE: {withheld} dismissals withheld. Rejections stay in the "
+                         f"ledger and are left alone on LinkedIn — ask the candidate "
+                         f"before passing --dismiss-rejections\n")
 
     if ledger and args.write_ledger:
         p = subprocess.run([sys.executable, LINKEDIN, "record"],
@@ -579,7 +573,8 @@ def main():
     c.add_argument("--query", action="append", help="run only this expanded cell (repeatable)")
     c.add_argument("--location", action="append", help="run only this location group (repeatable)")
     c.add_argument("--keyword", action="append", help="run only this keyword (repeatable)")
-    c.add_argument("--limit", type=int, default=None, help="cap postings fetched")
+    c.add_argument("--fresh", action="store_true",
+                   help="discard an unfinished run instead of resuming it")
     c.add_argument("--workers", type=int, default=1,
                    help="parallel description fetches (SKILL.md step 0; capped at 4)")
     c.set_defaults(func=cmd_collect)
@@ -593,7 +588,11 @@ def main():
     r.add_argument("--only", choices=SOURCES,
                    help="route only this source's verdicts, ignoring the rest")
     r.add_argument("--apply-linkedin", action="store_true",
-                   help="save/dismiss the jobs on LinkedIn itself (needs a session)")
+                   help="bookmark the keepers on LinkedIn itself (needs a session). "
+                        "Rejections are NOT dismissed unless --dismiss-rejections")
+    r.add_argument("--dismiss-rejections", action="store_true",
+                   help="with --apply-linkedin, also dismiss every NOT_INTERESTED job "
+                        "on LinkedIn. Off by default — ask the candidate first")
     r.add_argument("--dry-run", action="store_true",
                    help="with --apply-linkedin, print the LinkedIn calls without sending them")
     r.add_argument("--write-ledger", action="store_true",
