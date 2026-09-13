@@ -69,6 +69,26 @@ def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def clean_keep_parens(s):
+    """Like clean(), but keeps parenthetical content.
+
+    clean() strips "(...)" as a board-specific stack gloss, which is right
+    when a description is also being compared — the parenthetical is noise
+    next to the real signal. But when a posting has NO description (see the
+    "unreadable" branch of compare()), the title is the only signal left, and
+    a company's own postings routinely differ only in that parenthetical:
+    "Senior Software Engineer (React Native)" vs "(Typescript and AI)" at
+    Company G Technology, or "(Angular.js/React.js)" vs "(React.js+Next.js)" at
+    Company F are two different openings, not two copies of one. Stripping the
+    parens before comparing collapsed both pairs on 2026-09-13's pipeline
+    sweep. So the no-description fallback compares titles with parens intact.
+    """
+    s = (s or "").lower()
+    s = TITLE_NOISE.sub(" ", s)
+    s = re.sub(r"[^a-z0-9Ѐ-ӿĀ-ſ() ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def company_key(name):
     return re.sub(r"\s+", " ", COMPANY_NOISE.sub(" ", clean(name))).strip()
 
@@ -225,8 +245,21 @@ def compare(x, y, sx=None, sy=None, cx=None, cy=None):
 
     # An unreadable posting has no description to compare. Its title and
     # company are all there is, and it carries nothing the other copy lacks.
+    # Compared with parens kept (see clean_keep_parens): with no description
+    # to corroborate, a title match is the only evidence, and the noise
+    # clean() strips for the scored path is often the one thing that tells
+    # two same-company postings apart here.
     if not (x.get("description") and y.get("description")):
-        return ("same", score) if same_title else (None, score)
+        same_title_strict = (clean_keep_parens(x.get("title")) == clean_keep_parens(y.get("title"))
+                              and clean_keep_parens(x.get("title")))
+        if same_title_strict:
+            return "same", score
+        # Titles match once parentheticals are stripped but not with them kept:
+        # the very case that produced the Company F/Company G false merges. There
+        # is no description to settle it either way, so it is reported rather
+        # than silently dropped — "never drop anything in silence" applies to
+        # the unreadable path too.
+        return ("suspect", score) if same_title else (None, score)
 
     if score >= AUTO_MERGE:
         return "same", score
@@ -943,6 +976,14 @@ def cmd_pipeline(args):
         with open(path) as f:
             payload = json.load(f)
         rows = payload.get("applications", payload) if isinstance(payload, dict) else payload
+        if isinstance(payload, dict) and "total" in payload and payload["total"] != len(rows):
+            raise SystemExit(
+                f"{path}: get_my_applications reported total={payload['total']} but "
+                f"this file only holds {len(rows)} records — it looks like a single "
+                f"page (limit=100) was saved instead of the full result set. Fetch "
+                f"every page (increase `limit` and/or page through with `page`) and "
+                f"merge them into one file before running `pipeline`, or a duplicate "
+                f"sitting past the first page will be missed silently.")
         for app in rows:
             rec = normalise_application(app)
             if rec["ref"] in seen:      # the same record under two status queries

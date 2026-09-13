@@ -268,8 +268,18 @@ python3 $C/check.py cluster --batch /tmp/pipeline.json -o /tmp/pipeline.clustere
 
 `--applications` takes saved `get_my_applications` answers, one file per
 status. `SAVED` and `APPLIED` are the pair worth checking — they are the live
-pipeline, and small (85 records on 2026-09-10, against 5730 `NOT_INTERESTED`).
+pipeline, and small (164 records on 2026-09-13, against 5730+ `NOT_INTERESTED`).
 Add `REJECTED` when the question is whether a re-listing is worth a second try.
+
+**Page every status file to its own `total` before saving it.** `get_my_applications`
+caps at `limit=100` per call; a pipeline this size already exceeds that on the `SAVED`
+side alone. On 2026-09-13 a duplicate check was run against a `SAVED` file that only
+held the first 100 of 148 records — the two duplicates sitting on page 2 (Company V,
+Company E/Company E Ltd re-saved days apart) were invisible to the tool and only surfaced by a
+manual re-read. `pipeline` now refuses a file whose `total` doesn't match its record
+count, but the fix is to fetch every page (`page=1,2,...` until `total` records are
+collected) and merge them into one JSON file before calling `pipeline` — the guard
+only stops the silent miss, it doesn't collect the missing pages for you.
 
 **Where the descriptions come from.** `get_my_applications` returns a vacancy
 *summary*, and clustering is decided on descriptions; re-reading 85 of them
