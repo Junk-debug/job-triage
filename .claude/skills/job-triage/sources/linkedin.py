@@ -453,6 +453,25 @@ def expand_queries(filters):
     return out, collapsed
 
 
+def override_time_window(queries, since_days):
+    """Replace each query's f_TPR with an exact custom window.
+
+    f_TPR takes any r<seconds> value, not just the four constants documented
+    in filters.json (r86400/r604800/r1209600/r2592000) — confirmed live
+    2026-09-15: f_TPR=r200000 (~2.3 days) returned only cards dated within
+    that window. For an ad-hoc narrow ask ("since Saturday") this is the
+    right lever: it cuts the request/fetch volume at the source, instead of
+    running the full configured window (14 days by default) and throwing most
+    of it away with --max-age-days, which only filters client-side after
+    every card and description has already been paged through and fetched.
+    """
+    seconds = max(1, round(since_days * 86400))
+    tpr = f"r{seconds}"
+    for q in queries:
+        q["params"]["f_TPR"] = tpr
+    return queries
+
+
 def age_cutoff(max_age_days):
     if not max_age_days:
         return None
@@ -514,6 +533,8 @@ def cmd_search(args):
         queries = [q for q in queries if q["name"] in args.query]
     if not queries:
         sys.exit("no queries left after filtering — check --location / --keyword / --query")
+    if args.since_days:
+        queries = override_time_window(queries, args.since_days)
 
     if args.dry_run:
         caps = [resolve_pages(args.max_pages, q["max_pages"]) for q in queries]
@@ -846,6 +867,8 @@ def cmd_collect(args):
         queries = [q for q in queries if q["name"] in args.query]
     if not queries:
         sys.exit("no queries left after filtering — check --location / --keyword / --query")
+    if args.since_days:
+        queries = override_time_window(queries, args.since_days)
 
     run_dir = args.state or args.out + ".run"
     state_path = os.path.join(run_dir, "state.json")
@@ -1075,6 +1098,13 @@ def main():
                         "sample cheaply, not to shorten a real run — a cap silently "
                         "truncates (measured: a 3-page cap saw 28 of 402 postings)")
     s.add_argument("--max-age-days", type=int, default=None, help="drop cards older than this")
+    s.add_argument("--since-days", type=float, default=None,
+                   help="override f_TPR with this exact window (fractional days ok) "
+                        "instead of filters.json's configured one. f_TPR takes any "
+                        "r<seconds>, not just the 4 documented constants (confirmed "
+                        "2026-09-15) — use this for a narrow ad-hoc ask instead of "
+                        "running the full configured window and dropping most of it "
+                        "with --max-age-days after the fact")
     s.set_defaults(func=cmd_search)
 
     c = sub.add_parser("collect", help="search + fetch as one interruptible, resumable run")
@@ -1091,6 +1121,8 @@ def main():
     c.add_argument("--max-pages", type=int, default=None,
                    help="cap pages per query — for sampling only, see `search --help`")
     c.add_argument("--max-age-days", type=int, default=None, help="drop cards older than this")
+    c.add_argument("--since-days", type=float, default=None,
+                   help="override f_TPR with this exact window — see `search --help`")
     c.add_argument("--workers", type=int, default=1,
                    help=f"parallel description fetches, capped at {MAX_FETCH_WORKERS} (default 1)")
     c.set_defaults(func=cmd_collect)

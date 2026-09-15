@@ -196,6 +196,8 @@ def cmd_collect(args):
            "--workers", str(args.workers)]
     if args.max_age_days:
         cmd += ["--max-age-days", str(args.max_age_days)]
+    if args.since_days:
+        cmd += ["--since-days", str(args.since_days)]
     if args.max_pages:
         cmd += ["--max-pages", str(args.max_pages)]
     if args.fresh:
@@ -569,6 +571,10 @@ def main():
     c.add_argument("--source", required=True, choices=["linkedin"])
     c.add_argument("-o", "--out", required=True, help="where to write the fetched jobs")
     c.add_argument("--max-age-days", type=int, default=None)
+    c.add_argument("--since-days", type=float, default=None,
+                   help="override f_TPR with this exact window instead of "
+                        "filters.json's configured one — for a narrow ad-hoc ask "
+                        "(e.g. 'since Saturday'), see sources/linkedin.py search --help")
     c.add_argument("--max-pages", type=int, default=None)
     c.add_argument("--query", action="append", help="run only this expanded cell (repeatable)")
     c.add_argument("--location", action="append", help="run only this location group (repeatable)")

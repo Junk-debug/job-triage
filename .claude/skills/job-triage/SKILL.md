@@ -280,6 +280,22 @@ percentage, the unreadable count and an ETA. Run it in the background with
 stderr sent to a log (`2> collect.log`) and `tail` that to report progress.
 The search has no ETA: a query's page count is unknown until it runs dry.
 
+**A narrow ad-hoc ask ("published since Saturday") wants `--since-days`, not
+`--max-age-days`.** `--max-age-days` only drops cards *after* the full
+configured window (14 days by default) has already been paged through and
+every new description fetched — the request volume is unchanged, only what
+survives client-side filtering shrinks. `--since-days N` instead overrides
+`f_TPR` itself with an exact `r<seconds>` value, which LinkedIn's search
+actually respects (confirmed live 2026-09-15 — see `filters.json`), so the
+narrower window is applied at the source: fewer cards paged, fewer
+descriptions fetched, a much shorter run. Learned the hard way on 2026-09-15:
+a "since Saturday" request was run with the default 14-day window and
+`--max-age-days 2`, taking ~45 minutes for a ~2-day ask.
+
+```bash
+python3 $S/triage.py collect --source linkedin --since-days 2.5 --workers 2 -o /tmp/linkedin.json
+```
+
 The two halves also exist separately, when you want to inspect the search
 before spending the fetches. They are neither checkpointed nor resumable —
 prefer `collect` for a real run:
