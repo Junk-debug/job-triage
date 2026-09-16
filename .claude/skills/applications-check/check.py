@@ -190,6 +190,23 @@ SHINGLE = 3
 # sink both applications — so the pair is raised as a question instead.
 AGENCY = 0.35
 
+# Against the pipeline a keeper is compared with every tracked record of its
+# company, and a re-listed job is often rewritten, not copied. Company J's
+# "Frontend/Games Developer", applied to in August, came back from LinkedIn as
+# "Frontend Game Developer" with the text paraphrased — 0.49 — and iTeamly
+# re-posted an applied role word for word under a new title (1.00). Both were
+# saved again on 2026-09-15/16 because `match` compared exact titles only.
+#
+# SUSPECT (0.50) cannot catch the paraphrase and is useless here anyway: on the
+# 2026-09-13 LinkedIn batch, 26% of 1679 different-job pairs inside one company
+# score above it on boilerplate alone (p90 0.57, p99 0.71). The title is what
+# separates them. Requiring title similarity >= ASK_TITLE AND description
+# >= ASK_DESC left 16 of those 1679 pairs (1%), most of them near-copies worth
+# the question, and holds both real misses. Such a keeper is not flipped: it
+# becomes UNDECIDED with a question, so it is written nowhere until answered.
+ASK_TITLE = 0.70
+ASK_DESC = 0.30
+
 # A seniority difference is never cosmetic: "Junior" and "Senior" at one
 # company are two jobs whatever the descriptions share.
 SENIORITY = {"intern": 0, "junior": 1, "mid": 2, "middle": 2, "regular": 2,
@@ -217,6 +234,16 @@ def seniority_of(title):
 def seniority_conflict(a, b):
     sa, sb = seniority_of(a), seniority_of(b)
     return bool(sa and sb and not (sa & sb))
+
+
+def title_words(title):
+    # Plural folded, so "Games Developer" and "Game Developer" are one title.
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in clean(title).split()}
+
+
+def title_similarity(a, b):
+    wa, wb = title_words(a), title_words(b)
+    return len(wa & wb) / len(wa | wb) if wa | wb else 0.0
 
 
 def compare(x, y, sx=None, sy=None, cx=None, cy=None):
@@ -496,6 +523,7 @@ def keepers(verdicts, batch):
             "company": item.get("company") or v.get("company"),
             "title": item.get("title") or v.get("title"),
             "link": item.get("link") or v.get("link"),
+            "description": item.get("description"),
             "verdict": v,
         })
     return out
@@ -537,18 +565,27 @@ def flatten_candidates(payload):
 # matching
 # --------------------------------------------------------------------------
 
-def match(keeper, applications):
-    """Find the application this keeper duplicates, or None.
+def match(keeper, candidates, company_of):
+    """Find the application this keeper duplicates.
 
-    Three ways in, strongest first. Each is a fact about the record rather
-    than a resemblance, except the last, which is why the last one reports
-    what it matched on.
+    Returns (app, matched_by) for a duplicate, or ([(app, why), ...], None)
+    for records too close to wave through and not close enough to flip, or
+    (None, None). `candidates` are (application, normalised record) pairs
+    whose record carries a description where one could be read;
+    `company_of` resolves a company name to its alias-aware key.
+
+    The link and the LinkedIn id are facts about the record. Everything after
+    them is a resemblance, decided on the descriptions whenever both exist:
+    a shared title is not one job (Company C, 0.595), and a new title is not a new
+    job (iTeamly, 1.00).
     """
     k_link = link_key(keeper.get("link"))
-    k_key = job_key(keeper.get("company"), keeper.get("title"))
+    k_company = company_of(keeper.get("company"))
+    k_title = clean(keeper.get("title"))
+    k_shingles = shingles(keeper.get("description"))
 
-    fallback = None
-    for app in applications:
+    same, ask = None, []
+    for app, rec in candidates:
         vac = app.get("vacancy") or {}
 
         # The same onetap record, not a duplicate of it. Only reachable if the
@@ -565,10 +602,29 @@ def match(keeper, applications):
             if sid and sid in haystack:
                 return app, "linkedin job id"
 
-        if k_key[0] and k_key[1] and job_key(vac.get("companyName"), vac.get("title")) == k_key:
-            fallback = fallback or (app, "company + title")
+        if not k_company or company_of(vac.get("companyName")) != k_company:
+            continue
+        if same or seniority_conflict(keeper.get("title"), vac.get("title")):
+            continue
 
-    return fallback
+        tsim = title_similarity(keeper.get("title"), vac.get("title"))
+        same_title = bool(k_title) and clean(vac.get("title")) == k_title
+        if keeper.get("description") and rec.get("description"):
+            score = containment(k_shingles, shingles(rec["description"]))
+            if score >= AUTO_MERGE:
+                same = (app, f"description ({score:.2f} containment, title "
+                             f"similarity {tsim:.2f})")
+            elif same_title or (tsim >= ASK_TITLE and score >= ASK_DESC):
+                ask.append((app, f"title similarity {tsim:.2f}, description "
+                                 f"containment {score:.2f}"))
+        elif same_title:
+            same = (app, "company + title (no description to compare)")
+        elif tsim >= ASK_TITLE:
+            ask.append((app, f"title similarity {tsim:.2f}, no description to compare"))
+
+    if same:
+        return same
+    return (ask, None) if ask else (None, None)
 
 
 def reason_for(keeper, app, matched_by):
@@ -790,12 +846,48 @@ def cmd_match(args):
     with open(args.candidates) as f:
         applications, truncated = flatten_candidates(json.load(f))
 
-    hits, flipped_refs = [], {}
+    names = [{"company": k.get("company")} for k in ks] + \
+            [{"company": (a.get("vacancy") or {}).get("companyName")} for a in applications]
+    alias = company_aliases(names)
+
+    def company_of(name):
+        key = company_key(name)
+        return alias.get(key, key)
+
+    # Descriptions are read only for the records that share a company with a
+    # keeper — the only ones match() compares text against.
+    wanted = {company_of(k.get("company")) for k in ks} - {""}
+    candidates = [(a, normalise_application(a)) for a in applications
+                  if a.get("vacancy", {}).get("id")]
+    to_read = [rec for a, rec in candidates if company_of(rec["company"]) in wanted]
+    missing = describe_candidates(to_read, args)
+    if missing:
+        lines = "\n".join(f"  {i}  {c} / {t}  ({w})" for i, c, t, w in missing)
+        raise SystemExit(
+            f"{len(missing)} tracked record(s) share a company with a keeper but "
+            f"have no description to compare, so a re-listed copy under a new "
+            f"title would pass unseen. Read each with get_vacancy and pass them "
+            f"as --descriptions '{{\"<vacancy id>\": \"<descriptionText>\"}}' "
+            f"(an empty string is accepted for a posting that has none):\n{lines}")
+
+    hits, flipped_refs, asked, asked_refs = [], {}, [], {}
     for k in ks:
-        found = match(k, applications)
+        found, matched_by = match(k, candidates, company_of)
+        if found and matched_by is None:
+            question = (f"Possibly a duplicate of something already in the pipeline - "
+                        f"confirm before writing it: " + "; ".join(
+                            f"{(a.get('vacancy') or {}).get('companyName')} / "
+                            f"{(a.get('vacancy') or {}).get('title')} "
+                            f"[{a.get('status')}] {(a.get('vacancy') or {}).get('link')} "
+                            f"({why})" for a, why in found))[:1000]
+            asked_refs[k["ref"]] = question
+            asked.append({"ref": k["ref"], "company": k.get("company"),
+                          "title": k.get("title"), "link": k.get("link"),
+                          "question": question})
+            continue
         if not found:
             continue
-        app, matched_by = found
+        app = found
         vac = app.get("vacancy") or {}
         reason = reason_for(k, app, matched_by)
         flipped_refs[k["ref"]] = reason
@@ -822,6 +914,11 @@ def cmd_match(args):
         if v.get("ref") in flipped_refs:
             v = dict(v, verdict="NOT_INTERESTED", reason=flipped_refs[v["ref"]],
                      was="SAVED", duplicate=True)
+        elif v.get("ref") in asked_refs:
+            # UNDECIDED is written nowhere, so the keeper waits for the
+            # candidate's answer instead of entering the pipeline twice.
+            v = dict(v, verdict="UNDECIDED", question=asked_refs[v["ref"]],
+                     was="SAVED", possible_duplicate=True)
         out_verdicts.append(v)
 
     # Every verdict is final at this point - cluster expansion and the
@@ -840,8 +937,10 @@ def cmd_match(args):
         "keepers_checked": len(ks),
         "applications_searched": len(applications),
         "duplicates_found": len(hits),
-        "still_keepers": len(ks) - len(hits),
+        "possible_duplicates": len(asked),
+        "still_keepers": len(ks) - len(hits) - len(asked),
         "hits": hits,
+        "ask_candidate": asked,
         "suspected_duplicates_total": len(suspected),
         "suspected_duplicates_live": live_suspected,
         "same_job_different_company_total": len(cross_company),
@@ -854,6 +953,11 @@ def cmd_match(args):
         result["verdicts"] = f"written to {args.out}"
         sys.stderr.write(f"{len(hits)} of {len(ks)} keepers were already in the "
                          f"pipeline -> {args.out}\n")
+    if asked:
+        sys.stderr.write(f"{len(asked)} keeper(s) look like something already tracked "
+                         f"and were set UNDECIDED - ask the candidate (ask_candidate):\n")
+        for a in asked:
+            sys.stderr.write(f"  {a['ref']}  {a['company']} / {a['title']}\n")
     if truncated:
         sys.stderr.write(f"WARNING: {len(truncated)} query(s) returned only part of "
                          f"their matches — narrow them and re-run before trusting "
@@ -957,6 +1061,73 @@ def page_description(rec, cache):
     # public page to index, so it has no JobPosting block. Its description has
     # to come from get_vacancy, through --descriptions.
     return "no JobPosting block (custom vacancy?)"
+
+
+LINKEDIN_ID = re.compile(r"(?:LinkedIn\D{0,12}|linkedin\.com/jobs/view/(?:[^/\s]*-)?)(\d{9,11})", re.I)
+
+
+def linkedin_id_of(rec, ledger_ids):
+    m = LINKEDIN_ID.search(f"{rec.get('link') or ''} {rec.get('notes') or ''}")
+    return m.group(1) if m else ledger_ids.get(rec["source_id"])
+
+
+def describe_candidates(recs, args):
+    """Give every record a description, or name the ones that could not get one.
+
+    A custom vacancy (every LinkedIn keeper is written as one) has no public
+    page, so it is read back from LinkedIn's guest endpoint by the job id in its
+    notes or in the ledger — no login, one polite call at a time. Whatever is
+    still blank must come through --descriptions from get_vacancy.
+    """
+    supplied = {}
+    if args.descriptions:
+        with open(args.descriptions) as f:
+            supplied = json.load(f)
+    todo = []
+    for rec in recs:
+        if rec["source_id"] in supplied:
+            rec["description"] = supplied[rec["source_id"]] or None
+            rec["description_supplied"] = True
+        else:
+            todo.append(rec)
+    if args.no_fetch:
+        return [(r["source_id"], r["company"], r["title"], "not fetched") for r in todo]
+
+    cache = args.cache or os.path.join(
+        os.path.dirname(os.path.abspath(args.out or ".")), "pages")
+    os.makedirs(cache, exist_ok=True)
+    why = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        for rec, w in zip(todo, ex.map(lambda r: page_description(r, cache), todo)):
+            if w:
+                why[rec["source_id"]] = w
+
+    blank = [r for r in todo if not r["description"]]
+    if blank:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "job-triage", "sources"))
+        import linkedin as li
+        ledger_ids = {j.get("onetap_vacancy_id"): jid
+                      for jid, j in li.load_ledger().get("jobs", {}).items()
+                      if j.get("onetap_vacancy_id")}
+        for rec in blank:
+            jid = linkedin_id_of(rec, ledger_ids)
+            if not jid:
+                continue
+            path = os.path.join(cache, f"linkedin-{jid}.txt")
+            if os.path.exists(path):
+                rec["description"] = open(path, encoding="utf-8").read() or None
+            else:
+                job = li.fetch_posting(jid)
+                li.polite()
+                if job.get("ok"):
+                    open(path, "w", encoding="utf-8").write(job["description"])
+                    rec["description"] = job["description"]
+                else:
+                    why[rec["source_id"]] = f"LinkedIn {jid}: {job.get('error')}"
+
+    return [(r["source_id"], r["company"], r["title"], why.get(r["source_id"], "no description"))
+            for r in todo if not r["description"]]
 
 
 def cmd_pipeline(args):
@@ -1077,7 +1248,14 @@ def main():
     m.add_argument("--verdicts", required=True)
     m.add_argument("--candidates", required=True,
                    help="the saved get_my_applications answers")
-    m.add_argument("--batch", help="the triage.py batch, for company and title")
+    m.add_argument("--batch", help="the triage.py batch, for company, title and description")
+    m.add_argument("--descriptions",
+                   help='{"<vacancy id>": "description"} for tracked records with no '
+                        "readable page, read with get_vacancy")
+    m.add_argument("--cache", help="where to keep fetched pages (default: pages/ beside --out)")
+    m.add_argument("--workers", type=int, default=6)
+    m.add_argument("--no-fetch", action="store_true",
+                   help="use only what --descriptions supplies")
     m.add_argument("-o", "--out", help="write the patched verdicts here")
     m.set_defaults(func=cmd_match)
 

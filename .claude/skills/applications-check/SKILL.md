@@ -212,7 +212,8 @@ that query with the distinctive words of the title added.
 
 ```bash
 python3 $C/check.py match --verdicts /tmp/verdicts.json --batch /tmp/batch.clustered.json \
-        --candidates /tmp/candidates.json -o /tmp/verdicts.checked.json
+        --candidates /tmp/candidates.json [--descriptions /tmp/descriptions.json] \
+        -o /tmp/verdicts.checked.json
 ```
 
 This does three things. First it **expands the clusters**: every duplicate
@@ -230,13 +231,39 @@ candidate, not the raw ones from `cluster`.
 
 Then it matches the keepers against the pipeline, strongest evidence first:
 
-| Matched on | What it means |
+| Matched on | Outcome |
 |---|---|
-| `link` | the same URL is already tracked |
-| `linkedin job id` | the id appears in a tracked vacancy's link or notes — saved from LinkedIn on an earlier run |
-| `company + title` | normalised company and title are equal |
+| `link` | flipped — the same URL is already tracked |
+| `linkedin job id` | flipped — the id appears in a tracked vacancy's link or notes |
+| `description` ≥ 0.85 containment, same company, no seniority conflict | flipped — whatever the titles say |
+| title similarity ≥ 0.70 and description ≥ 0.30, or an identical title with descriptions that disagree | **`UNDECIDED`** with a question naming the tracked record |
+| `company + title`, only when a description is missing on either side | flipped |
 
-Each hit is flipped with a note naming what it duplicates, its status, and the
+**Titles alone never settle it.** Until 2026-09-16 the last row was the only
+resemblance check, and two keepers already applied to were saved again: iTeamly
+re-posted a role word for word under a new title (1.00 on the descriptions), and
+Company J's August posting came back from LinkedIn as "Frontend Game Developer"
+instead of "Frontend/Games Developer", rewritten (0.49). The 0.85 line is part 1's.
+The ask band is measured on the 2026-09-13 batch: description alone is useless
+there, since 26% of 1679 different-job pairs in one company clear 0.50 on
+boilerplate, but title ≥ 0.70 together with description ≥ 0.30 leaves 16 of them
+(1%) and still holds both misses. Translations are out of scope: a Polish and an
+English copy share no shingles.
+
+So `match` needs a description for every tracked record of a keeper's company.
+It reads the onetap page (cached under `--cache`), and for a custom vacancy, which
+has no public page, it reads LinkedIn's guest endpoint by the job id found in the
+notes or in `linkedin/ledger.json`. Anything still blank stops the run with
+the ids listed. **Do not work around that.** Read each one with `get_vacancy` and
+pass `--descriptions '{"<vacancy id>": "<descriptionText>"}'`. An empty string
+is accepted for a posting that genuinely has none, and it falls back to the title rules.
+
+An `UNDECIDED` from this step is listed under `ask_candidate` and is written
+nowhere by `route`. Put the question to the candidate. On "same job", set it
+`NOT_INTERESTED` with the duplicate note below; on "different job", restore
+`SAVED`.
+
+Each flip gets a note naming what it duplicates, its status, and the
 fact that it *passed* the gates:
 
 ```

@@ -498,6 +498,12 @@ It also re-filters step 3's `suspected_duplicates` and
 the groups with a surviving member, dropping the ones that turned out
 entirely `NOT_INTERESTED`. Report from these, not from step 3's raw counts.
 
+The match reads descriptions, not just titles, because re-listed jobs come back
+under new titles. If it stops and lists tracked records with no readable
+description, fetch them with `get_vacancy` and re-run with `--descriptions`.
+A keeper that looks like a tracked record without being provably the same comes
+back `UNDECIDED` under `ask_candidate`. Ask the candidate before routing.
+
 Report every flip to the candidate. A keeper dropped silently is
 indistinguishable from a keeper that never existed.
 
