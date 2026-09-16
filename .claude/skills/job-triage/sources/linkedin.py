@@ -473,9 +473,16 @@ def override_time_window(queries, since_days):
 
 
 def age_cutoff(max_age_days):
+    """Midnight N days ago, not "N*24h ago" — `posted_at` is a date with no
+    time of day, so comparing it against a same-day cutoff that carries the
+    current wall-clock time drops the entire boundary day. Confirmed
+    2026-09-16: --max-age-days 2 run at 17:18 UTC dropped all 113 postings
+    dated two days back, because midnight (their implicit time) is always
+    before 17:18 on the same calendar day."""
     if not max_age_days:
         return None
-    return datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    return cutoff.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def is_stale(card, cutoff):
