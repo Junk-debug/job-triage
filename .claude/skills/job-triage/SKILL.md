@@ -529,7 +529,14 @@ For a LinkedIn save, add to the verdict whatever the posting states —
 `publishedAt`, and `cityIds` / `countryIds` / `categoryIds` sourced from
 `get_my_filters` or `list_cities`. **Never guess an id.** A bare record is not
 worth keeping months later. Title, company, link and description are filled in
-from the batch automatically.
+from the batch by `route` — into the JSON, not into the call. You carry each
+entry into `create_custom_vacancy` yourself, so copy `description` **verbatim**:
+never summarise, trim or paraphrase it. The onetap record is the only copy the
+candidate keeps once the LinkedIn posting expires, and it is what a tailored CV
+is written from. On 2026-09-19 all 19 keepers went in as ~700-character
+summaries headed "Summary of the posting (full text at the source link)" and had
+to be restored by hand. If the budget will not stretch to the full texts, stop
+and say so — do not shorten them to fit.
 
 `link` is unique per user. A repeat answers `VACANCY_LINK_ALREADY_EXISTS` with
 `payload.existingVacancyId` — never retry the create, call
