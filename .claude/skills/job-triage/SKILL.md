@@ -62,7 +62,8 @@ python3 $C/check.py cluster --batch /tmp/batch.json -o /tmp/batch.clustered.json
 python3 $S/triage.py route /tmp/verdicts.checked.json --batch /tmp/batch.clustered.json
 ```
 
-**onetap only:** save the `search_vacancies` response to `/tmp/onetap.json`, then
+**onetap only:** save **every page** of the `search_vacancies` response (follow
+`nextCursor` to the end — see step 1) into `/tmp/onetap.json`, then
 
 ```bash
 python3 $S/triage.py batch --onetap /tmp/onetap.json -o /tmp/batch.json
@@ -238,6 +239,32 @@ risk.
 `useSavedFilters` over transcribing the fields by hand — a forgotten
 per-workplace `cities` / `countries` silently returns worldwide results.
 Save the response to `/tmp/onetap.json`.
+
+**Page to the end, and never trust `total`.** A response carries `total`,
+`maxExactCount` and `nextCursor`. `total` is **capped** at `maxExactCount`
+(100), so `total: 100` means "100 or more", not "100". On 2026-10-01 that was
+read as the whole feed: page 1 was judged and reported as "100 new" while page 2
+held 90 more, and the candidate had to catch it. The feed is finished only when
+`nextCursor` is absent. Use `limit: 100`, pass each `nextCursor` back as
+`cursor` unchanged, and stop only when a response has none. Responses this size
+are saved by the harness to a `tool-results/*.txt` file, so read them with
+Python, not by eye:
+
+```bash
+python3 - <<'EOF'
+import json
+pages = ["/path/page1.txt", "/path/page2.txt"]   # every saved response, in order
+out = {"vacancies": [], "pages": len(pages)}
+for p in pages:
+    out["vacancies"] += json.load(open(p))["vacancies"]
+json.dump(out, open("/tmp/onetap.json", "w"))
+print(len(out["vacancies"]), "vacancies from", len(pages), "pages")
+EOF
+```
+
+The last page's `nextCursor` must be empty; if the last file you merged still
+has one, a page is missing. Report the real count ("190 new over 2 pages"),
+never the `total`.
 
 **LinkedIn.** No login, no cookies — `sources/linkedin.py` uses LinkedIn's
 public `jobs-guest` endpoints. (Only the *writes* in step 5 need a session.)
