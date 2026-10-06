@@ -58,7 +58,7 @@ STALL_PAGES = 2         # consecutive all-repeat pages before calling it done
 # Parallel description fetches. Guest reads carry no cookies, so the account
 # is never exposed, but the IP is the one the candidate's browser uses and
 # LinkedIn throttles bursts - so the ceiling stays low whatever is asked for.
-MAX_FETCH_WORKERS = 4
+MAX_FETCH_WORKERS = 10
 SNAPSHOT_EVERY = 25     # collect rewrites its output after this many descriptions
 
 
