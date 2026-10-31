@@ -104,7 +104,7 @@ The primary then absorbs the rest:
 - **keyword and salary-hint lists are pooled** — more tags are strictly more
 - **fields the copies dispute** are reported on the record as
   `duplicates_disagree_on`, never resolved. One board saying Remote and another
-  Warsaw is exactly what Gate 3 needs to see.
+  city is exactly what Gate 3 needs to see.
 - descriptions are never merged. The judge reads one posting, not a collage.
 
 ### The two things it refuses to decide
@@ -247,7 +247,7 @@ instead of "Frontend/Games Developer", rewritten (0.49). The 0.85 line is part 1
 The ask band is measured on the 2026-09-13 batch: description alone is useless
 there, since 26% of 1679 different-job pairs in one company clear 0.50 on
 boilerplate, but title ≥ 0.70 together with description ≥ 0.30 leaves 16 of them
-(1%) and still holds both misses. Translations are out of scope: a Polish and an
+(1%) and still holds both misses. Translations are out of scope: a German and an
 English copy share no shingles.
 
 So `match` needs a description for every tracked record of a keeper's company.

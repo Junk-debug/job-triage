@@ -411,7 +411,7 @@ def enrich(primary, others):
     The point of keeping the richest copy is the information, not the record.
     Blank fields are filled from the other copies, tag lists are pooled, and a
     field two copies fill differently is reported rather than resolved — one
-    board saying Remote and another Warsaw is exactly what Gate 3 needs to see.
+    board saying Remote and another city is exactly what Gate 3 needs to see.
 
     Descriptions are never merged: the judge reads one posting, not a collage.
     """

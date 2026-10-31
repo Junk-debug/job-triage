@@ -8,9 +8,13 @@ description: Triage vacancies from every source — the onetap.work feed and Lin
 Sort vacancies into `SAVED` and `NOT_INTERESTED` the way the candidate would,
 and record why.
 
-Read `criteria.md` in this skill directory before making any verdict. It holds
-the rules, the precedents, and the reasoning behind both. This file is the
-procedure; that file is the judgement.
+Read `gates.md` in this skill directory and the candidate's `criteria.md` in the
+data repo before making any verdict. `gates.md` is how a vacancy is judged;
+`criteria.md` holds the candidate's rules, the precedents, and the reasoning
+behind both. The data repo is found by `data_dir.py`
+(`python3 -c 'import data_dir; print(data_dir.require_data_dir())'` from this
+directory), and `init_data_repo.py` creates one when there is none. This file is
+the procedure.
 
 **One judgement, many sources.** `criteria.md` decides regardless of where a
 posting came from. What differs per source is only how vacancies are fetched
@@ -130,7 +134,7 @@ keyword found and how many of those were kept.
 LinkedIn has one location box and one workplace toggle, so it cannot express
 what onetap expresses in a single query:
 
-> remote anywhere in Poland **OR** hybrid/onsite in Warsaw **OR** Gdańsk
+> remote anywhere in one country **OR** hybrid/onsite in two named cities
 
 So the search is a cross product — every keyword × every location group × every
 time window — and each cell is fired as its own request. The union of their
@@ -408,35 +412,35 @@ failed. Work through `items` in the clustered batch and read `description` in fu
 **Never judge from the title — or from `keywords`, or from any source's tags.**
 On the calibration day, two roles with perfect titles hid Angular and Java in
 the body. All seven wrong verdicts in the 2026-09-04 re-audit failed this way.
-See Gate 0 in `criteria.md`.
+See Gate 0 in `gates.md`.
 
 Per-source traps, all the same trap:
 
 - **onetap `keywords`** are populated by the aggregator and routinely overstate
   a technology the body demotes to "podstawy" or drops entirely.
 - **LinkedIn workplace tags** are unreliable — the `f_WT=2` "remote" filter
-  returns plenty of on-site Warsaw and City X roles. Gate 3 reads the location
-  out of the body. A posting tagged `Warsaw` whose body opens "Location: Remote"
+  returns plenty of on-site roles. Gate 3 reads the location
+  out of the body. A posting tagged with a city whose body opens "Location: Remote"
   is remote.
 - **LinkedIn seniority tags** are unreliable — `Not Applicable` is common and
   genuine senior roles are tagged `Associate`. Gate 6 reads the stated years out
   of the body.
 - **LinkedIn salary** is absent from the guest view, so `salary` is null and
   `salary_hints` carries the money-looking lines from the description instead —
-  often a day rate (`1000–1300 PLN/MD B2B` ≈ 21–27k/month at ~21 man-days).
-  Normalise per §6. A posting with no salary is not rejected on that basis.
+  often a day rate (`400–500 EUR/day` ≈ 8.4–10.5k EUR/month at ~21 working days).
+  Normalise per Gate 4. A posting with no salary is not rejected on that basis.
 
 Items marked `unreadable` were pulled or closed between search and fetch. Give
 them verdict `UNREADABLE` so they stop coming back; never guess from the card.
 
 ### 5. Apply the gates
 
-Gates 1–6 from `criteria.md`, in order. The first failure ends the evaluation
+Gates 1–6 from `gates.md`, with the candidate's numbers from `criteria.md`, in order. The first failure ends the evaluation
 and names the reason. While reading, hold on to the specific line that decides
 it — the note needs it.
 
 When a gate genuinely cannot be settled from the posting — `criteria.md` names
-City X and City Y under §5 as exactly this — use verdict `UNDECIDED` with a
+places it cannot settle, in its Location section, as exactly this — use verdict `UNDECIDED` with a
 `question`. Undecided items are written nowhere, so they resurface on the next
 run once the candidate has answered. Do not guess and do not silently reject.
 
@@ -456,8 +460,9 @@ least loaded so they finish together.
 Spawn every agent in **one** message (Agent tool, `general-purpose`), one per
 entry of `manifest.json` → `agents`, each with this brief:
 
-> Read `.claude/skills/job-triage/criteria.md` in full first — it decides every
-> verdict. Then read each of these files in full: <its chunks>, in <dir>. For
+> Read `.claude/skills/job-triage/gates.md` and `<data dir>/criteria.md` in full
+> first — together they decide every verdict. (Substitute the absolute data dir
+> before sending the brief.) Then read each of these files in full: <its chunks>, in <dir>. For
 > each `chunk_NNN.txt` write `v_NNN.json` beside it: a JSON array, one object
 > per posting, in the shape of step 6 of `.claude/skills/job-triage/SKILL.md` —
 > `ref`, `verdict` (`SAVED`, `NOT_INTERESTED`, `UNDECIDED` with a `question`,
@@ -481,13 +486,13 @@ judged twice, a ref not in the batch, a save or rejection without a reason, an
 `UNDECIDED` without a question. Re-run the agent on that chunk. It **warns**,
 under `recheck`, about every rejection with no quote or with a quote that is
 not in the posting — diacritics, dashes and case are folded first, so
-ASCII-typed Polish still matches. Such a reason was paraphrased or invented:
+text typed without diacritics still matches. Such a reason was paraphrased or invented:
 re-read each of those postings yourself.
 
 Then, before step 7, read these in full yourself, whatever the agents said:
 every `SAVED`, every `UNDECIDED`, and every `recheck`. The agents settle the
 rejections; the keepers and the questions are what the candidate acts on, and
-there are few of them — 23 of 375 on 2026-09-10.
+there are few of them.
 
 ### 6. Write the verdicts
 
@@ -497,13 +502,13 @@ it stands — step 6 checks the keepers first and produces the file that is:
 ```json
 [
  {"ref": "onetap:cmtsy...", "verdict": "NOT_INTERESTED",
-  "reason": "Gate 1 - Angular is the frontend: 'Współtworzenie frontendu w Angular'. Team is 3 Angular devs."},
+  "reason": "Gate 1 - Framework X is the frontend: 'quoted requirement'. Team is 3 Framework X devs."},
  {"ref": "linkedin:4438943404", "verdict": "SAVED",
-  "reason": "Node.js/TS backend, fully remote from Poland, 4+ years. No salary posted - ask the rate.",
+  "reason": "Node.js/TS backend, fully remote, 4+ years. No salary posted - ask the rate.",
   "keywords": ["Node.js","TypeScript","AWS"], "workplaceType": ["REMOTE"],
   "experienceLevels": ["SENIOR"], "employmentTypes": ["FULL_TIME"]},
  {"ref": "linkedin:4464096634", "verdict": "UNDECIDED",
-  "question": "Company H, City X, perfect Node/TS stack. §5 names Company H/City X as unresolved — accept or reject?"}
+  "question": "Company H, City X, perfect stack. The Location section lists City X as unresolved — accept or reject?"}
 ]
 ```
 
@@ -715,7 +720,7 @@ Undocumented HTML endpoints, changed without notice.
 
 - **`search` returns zero cards for every query** — the search HTML changed, or
   the IP is throttled. Check by hand:
-  `curl -A "Mozilla/5.0" "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=React&location=Poland&start=0" | head -50`
+  `curl -A "Mozilla/5.0" "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=React&location=Germany&start=0" | head -50`
 - **`fetch` returns `ok: false` for everything** — the description selector
   changed (`show-more-less-html__markup`) or the guest view went behind an auth
   wall. Re-derive the selector from live HTML before touching anything else.
