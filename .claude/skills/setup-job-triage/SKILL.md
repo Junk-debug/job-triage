@@ -1,5 +1,5 @@
 ---
-name: setup-data-repo
+name: setup-job-triage
 description: Create the user's private data repo for job triage — the separate git repository that holds their criteria.md, the saved LinkedIn search, the ledger of judged jobs and the triage reports — and point this code repo at it. Use on a fresh clone, when any script reports "No data repo found", or when the user says "set me up", "create my data repo", "I just cloned job-triage".
 ---
 

@@ -60,7 +60,7 @@ class FindDataDirTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn(self.env_dir, message)
         self.assertIn(self.default_dir, message)
-        self.assertIn("setup-data-repo", message)
+        self.assertIn("setup-job-triage", message)
 
     def test_data_path_joins_inside_the_found_dir(self):
         os.makedirs(self.default_dir)

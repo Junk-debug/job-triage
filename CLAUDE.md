@@ -18,7 +18,7 @@ generic knowledge only. Everything about one person lives in a separate private
   batch to judge, and routes the verdicts back to the right call.
 - `.claude/skills/job-triage/data_dir.py` and `init_data_repo.py` — where the
   data repo is, and how to create one from `templates/data-repo/`.
-- `.claude/skills/setup-data-repo/SKILL.md` — the guided setup: create the data
+- `.claude/skills/setup-job-triage/SKILL.md` — the guided setup: create the data
   repo, fill `criteria.md`, generate the LinkedIn search. Run it on a fresh clone.
 - `.claude/skills/applications-check/SKILL.md` — whether a job is already
   known, in three senses: duplicated inside the batch (it clusters those before

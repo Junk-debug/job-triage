@@ -35,7 +35,7 @@ def require_data_dir():
         return found
     raise SystemExit(
         "No data repo found. Looked in: " + ", ".join(candidates()) + ".\n"
-        "Create one with the setup-data-repo skill, "
+        "Create one with the setup-job-triage skill, "
         f"or point {ENV_VAR} at an existing one."
     )
 

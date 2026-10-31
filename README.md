@@ -13,7 +13,7 @@ It is a set of agent skills (Claude Code, Codex) plus a few small Python scripts
 | `.claude/skills/job-triage/` | the triage run: `SKILL.md` is the procedure, `gates.md` is how a vacancy is judged, `triage.py` moves batches and verdicts around |
 | `.claude/skills/job-triage/sources/` | one adapter per source: `linkedin.py` reads, `linkedin_actions.py` saves and dismisses on the site |
 | `.claude/skills/applications-check/` | is this job already known: duplicated in the batch, or already in your pipeline |
-| `.claude/skills/setup-data-repo/` | creates your private data repo and walks you through filling it |
+| `.claude/skills/setup-job-triage/` | creates your private data repo and walks you through filling it |
 | `templates/data-repo/` | the skeleton of that data repo |
 | `tests/` | stdlib `unittest`, no network |
 
@@ -51,7 +51,7 @@ git clone <this repo's URL> job-triage
 claude                                 # or: codex — open it in the workspace
 ```
 
-Then ask: **"set me up"**. The `setup-data-repo` skill creates your private data repo
+Then ask: **"set me up"**. The `setup-job-triage` skill creates your private data repo
 from `templates/data-repo/`, then walks you through `criteria.md` section by section
 (stack, role type, location, salary, companies, seniority, language) and generates your
 LinkedIn search from the OneTap saved search. After that:
