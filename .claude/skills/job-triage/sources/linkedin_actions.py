@@ -43,10 +43,10 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# HERE is .claude/skills/job-triage/sources -> up four.
-REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-DATA = os.path.join(REPO, "linkedin")
-SESSION_PATH = os.path.join(DATA, "session.json")
+sys.path.insert(0, os.path.join(HERE, ".."))
+import data_dir
+
+SESSION_PATH = data_dir.resolve("linkedin", "session.json")
 
 API = "https://www.linkedin.com/voyager/api"
 FEEDBACK_URL = API + "/voyagerJobsDashJobPostingRelevanceFeedback?action={action}"
@@ -59,12 +59,22 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 # Tracking headers. Voyager rejects requests without x-restli-protocol-version;
 # the rest is what the web app sends and is cheaper to mirror than to test.
 CLIENT_VERSION = "1.13.46516"
+
+
+def local_timezone():
+    try:
+        target = os.path.realpath("/etc/localtime")
+    except OSError:
+        return "UTC"
+    return target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else "UTC"
+
+
 TRACK = json.dumps({
     "clientVersion": CLIENT_VERSION,
     "mpVersion": CLIENT_VERSION,
     "osName": "web",
-    "timezoneOffset": 2,
-    "timezone": "Europe/Warsaw",
+    "timezoneOffset": time.localtime().tm_gmtoff // 3600,
+    "timezone": local_timezone(),
     "deviceFormFactor": "DESKTOP",
     "mpName": "voyager-web",
 }, separators=(",", ":"))

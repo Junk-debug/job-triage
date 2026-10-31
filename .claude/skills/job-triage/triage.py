@@ -42,6 +42,9 @@ import unicodedata
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import data_dir
+
 LINKEDIN = os.path.join(HERE, "sources", "linkedin.py")
 LINKEDIN_ACTIONS = os.path.join(HERE, "sources", "linkedin_actions.py")
 
@@ -217,13 +220,12 @@ def cmd_collect(args):
 
 def cmd_sources(args):
     """What sources exist, how they are collected, and where their state lives."""
-    data_dir = os.path.join(HERE, "..", "..", "..", "linkedin")
-    ledger_path = os.path.join(data_dir, "ledger.json")
+    ledger_path = data_dir.resolve("linkedin", "ledger.json")
     judged = 0
     if os.path.exists(ledger_path):
         judged = len(json.load(open(ledger_path)).get("jobs", {}))
     has_session = (bool(os.environ.get("LINKEDIN_COOKIE"))
-                   or os.path.exists(os.path.join(data_dir, "session.json")))
+                   or os.path.exists(data_dir.resolve("linkedin", "session.json")))
     print(json.dumps({
         "onetap": {
             "collect": "MCP search_vacancies (agent calls it, saves the response)",

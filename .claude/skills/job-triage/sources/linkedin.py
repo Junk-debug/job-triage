@@ -37,13 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The config and the ledger are data the candidate reads and edits, so they
-# live in the repo proper rather than buried in .claude/ with the machinery.
-# REPO is .claude/skills/job-triage/sources -> up four.
-REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-DATA = os.path.join(REPO, "linkedin")
-FILTERS_PATH = os.path.join(DATA, "filters.json")
-LEDGER_PATH = os.path.join(DATA, "ledger.json")
+sys.path.insert(0, os.path.join(HERE, ".."))
+import data_dir
+
+FILTERS_PATH = data_dir.resolve("linkedin", "filters.json")
+LEDGER_PATH = data_dir.resolve("linkedin", "ledger.json")
 
 SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 POSTING_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
@@ -365,6 +363,7 @@ def fetch_posting(job_id):
 # --------------------------------------------------------------------------
 
 def load_ledger():
+    data_dir.require_data_dir()
     if not os.path.exists(LEDGER_PATH):
         return {"jobs": {}}
     with open(LEDGER_PATH) as f:
@@ -372,6 +371,8 @@ def load_ledger():
 
 
 def save_ledger(led):
+    data_dir.require_data_dir()
+    os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
     tmp = LEDGER_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(led, f, indent=2, ensure_ascii=False, sort_keys=True)
@@ -380,6 +381,7 @@ def save_ledger(led):
 
 
 def load_filters():
+    data_dir.require_data_dir()
     if not os.path.exists(FILTERS_PATH):
         sys.exit(f"no filters file at {FILTERS_PATH}")
     with open(FILTERS_PATH) as f:
@@ -678,8 +680,8 @@ def cmd_sync_filters(args):
                 # No verified geoId — a plain location string works just as
                 # well, it is only less precise about which "Warsaw" is meant.
                 country = ""
-                if kind == "city":
-                    country = ", Poland"
+                if kind == "city" and filters.get("default_country"):
+                    country = ", " + filters["default_country"]
                 p["location"] = f"{ascii_name}{country}"
 
     if places:
